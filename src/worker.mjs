@@ -1,5 +1,3 @@
---- START OF FILE worker.mjs ---
-
 import { Buffer } from "node:buffer";
 
 export default {
@@ -11,7 +9,38 @@ export default {
       console.error(err);
       // Check if err is an HttpError and return its status, otherwise use 500
       const status = (err instanceof HttpError) ? err.status : (err.status ?? 500);
-      return new Response(err.message, fixCors({ status }));
+      // Include Google API error details if available in the original error
+       let message = err.message;
+       if (err.originalResponseText) {
+           try {
+               const originalError = JSON.parse(err.originalResponseText);
+               if (originalError.error?.message) {
+                   // Prefer Google's detailed error message if present
+                   message = originalError.error.message;
+               } else if (originalError.message) {
+                   // Fallback to a non-standard top-level message
+                    message = originalError.message;
+               }
+           } catch (parseErr) {
+               // If original response text isn't JSON, just use the current message
+               console.error("Failed to parse original response text for error details:", parseErr);
+           }
+       }
+
+
+      // Structure the error response body similar to OpenAI's error object
+      const errorBody = {
+           error: {
+               message: message || "An unknown error occurred.",
+               type: (err instanceof HttpError) ? "api_error" : "internal_error", // Categorize errors
+               code: status, // Use the HTTP status code as the error code
+               // Include original Google API status if it's an HttpError that wrapped a response
+               ...(err.originalResponseStatus && { original_status: err.originalResponseStatus }),
+               // Add other details if needed, e.g., specific Google error codes
+           }
+      };
+
+      return new Response(JSON.stringify(errorBody), fixCors({ status }));
     };
     try {
       const auth = request.headers.get("Authorization");
@@ -24,36 +53,35 @@ export default {
       const { pathname } = new URL(request.url);
 
       // Normalize pathname by removing potential leading /v1 if present
-      // Some clients might send /v1/chat/completions, others just /chat/completions
-      // Let's keep endsWith for flexibility with base URLs
-      // const normalizedPathname = pathname.startsWith('/v1') ? pathname.substring(3) : pathname;
+      // This makes the endsWith checks work regardless of whether the client
+      // includes /v1 in the base URL or the path.
+      const normalizedPathname = pathname.startsWith('/v1') ? pathname.substring(3) : pathname;
+
 
       switch (true) {
         // Handles chat models (including multimodal like image generation through chat)
-        case pathname.endsWith("/chat/completions"):
+        case normalizedPathname.endsWith("/chat/completions"):
           assert(request.method === "POST", "Method Not Allowed", 405);
           return handleCompletions(await request.json(), apiKey)
             .catch(errHandler);
 
         // Handles embeddings models
-        case pathname.endsWith("/embeddings"):
+        case normalizedPathname.endsWith("/embeddings"):
           assert(request.method === "POST", "Method Not Allowed", 405);
           return handleEmbeddings(await request.json(), apiKey)
             .catch(errHandler);
 
         // Handles listing models
-        case pathname.endsWith("/models"):
+        case normalizedPathname.endsWith("/models"):
           assert(request.method === "GET", "Method Not Allowed", 405);
           return handleModels(apiKey)
             .catch(errHandler);
 
-        // --- NEW CASE FOR IMAGE GENERATION ---
         // Handles OpenAI-style image generation endpoint
-        case pathname.endsWith("/images/generations"):
+        case normalizedPathname.endsWith("/images/generations"):
           assert(request.method === "POST", "Method Not Allowed", 405);
           return handleImageGenerations(await request.json(), apiKey)
              .catch(errHandler);
-        // --- END NEW CASE ---
 
         default:
           throw new HttpError("404 Not Found", 404);
@@ -65,19 +93,25 @@ export default {
 };
 
 class HttpError extends Error {
-  constructor(message, status) {
+  constructor(message, status, originalResponseText = null, originalResponseStatus = null) {
     super(message);
     this.name = this.constructor.name;
     this.status = status;
+    this.originalResponseText = originalResponseText; // Store original response body text if available
+    this.originalResponseStatus = originalResponseStatus; // Store original response status if available
   }
 }
 
 const fixCors = ({ headers, status, statusText }) => {
   headers = new Headers(headers);
   headers.set("Access-Control-Allow-Origin", "*");
-  // Add other common headers if needed
-   headers.set("Access-Control-Allow-Methods", "*");
-   headers.set("Access-Control-Allow-Headers", "*");
+  headers.set("Access-Control-Allow-Methods", "*"); // Allow all methods for simplicity
+  headers.set("Access-Control-Allow-Headers", "*"); // Allow all headers for simplicity
+  headers.set("Content-Type", "application/json"); // Assume JSON response for most cases
+
+  // Add specific headers if needed
+  // headers.set("Cache-Control", "no-cache, must-revalidate");
+
   return { headers, status, statusText };
 };
 
@@ -114,29 +148,59 @@ async function handleModels (apiKey) {
     responseBodyText = await responseClone.text();
   } catch (e) {
     console.error("Error reading response text:", e);
-    return new Response(response.body, fixCors(response));
+     // Wrap fetch error in HttpError
+    throw new HttpError("Failed to read response body from Google API: " + e.message, 500);
   }
 
   if (response.ok) {
     try {
-      const { models } = JSON.parse(responseBodyText);
+      const data = JSON.parse(responseBodyText);
+       if (!data.models || !Array.isArray(data.models)) {
+            // Check if it's an error structure despite 200 status
+            if (data.error) {
+               console.error("Google API error in Models JSON body:", data.error);
+               // Re-throw as HttpError to be caught by errHandler
+                throw new HttpError(data.error.message || "Google API error listing models.", data.error.code || 500, responseBodyText, response.status);
+            }
+            throw new Error("Unexpected response format: 'models' array not found or invalid.");
+       }
+
       body = JSON.stringify({
         object: "list",
-        data: models.map(({ name }) => ({
+        data: data.models.map(({ name }) => ({
           id: name.replace("models/", ""),
           object: "model",
-          created: 0,
+          created: 0, // Static, as original API doesn't provide timestamp
           owned_by: "google",
         })),
-      }, null, "  ");
+      }, null, "  "); // Pretty print for debugging
     } catch (err) {
       console.error("Error processing models response:", err);
-      return new Response(responseBodyText, fixCors(response));
+       // If transformation fails, wrap in HttpError
+       // If err is already HttpError (from recursive check), re-throw it
+       if (err instanceof HttpError) throw err;
+      throw new HttpError("Error processing models response from Google API: " + err.message, 500, responseBodyText, response.status);
     }
   } else {
-    body = responseBodyText;
+     // If the original response was not ok, wrap the error details
+      console.error("Google API returned error status for models:", response.status, response.statusText, responseBodyText);
+      // Try to parse for a more specific message, otherwise use status text
+      let errorMessage = response.statusText;
+      try {
+          const errorData = JSON.parse(responseBodyText);
+          if (errorData.error?.message) {
+              errorMessage = errorData.error.message;
+          } else if (errorData.message) {
+              errorMessage = errorData.message;
+          }
+      } catch (parseErr) {
+          console.error("Failed to parse Google API error body for models:", parseErr);
+          // Use default statusText if parsing fails
+      }
+       throw new HttpError(errorMessage, response.status, responseBodyText, response.status);
   }
 
+  // Return the transformed body or the original error body with CORS headers
   return new Response(body, fixCors(response));
 }
 
@@ -148,8 +212,6 @@ async function handleEmbeddings (req, apiKey) {
   let modelName = req.model; // Get the model name from the request
 
   if (typeof modelName !== "string" || !modelName) {
-    // If model is not specified or not a string, use the default.
-    // In a strict API proxy, one might throw an error instead.
      console.warn(`Model not specified or invalid for embeddings. Using default: ${DEFAULT_EMBEDDINGS_MODEL}`);
      modelName = DEFAULT_EMBEDDINGS_MODEL;
   }
@@ -159,30 +221,28 @@ async function handleEmbeddings (req, apiKey) {
 
   // Input can be a string or array of strings
   if (!Array.isArray(req.input)) {
-    // If input is a single value (string, number, etc.), wrap it in an array.
-    // Ensure it's treated as text input.
      if (req.input === null || req.input === undefined) {
          throw new HttpError("Input is required for embeddings.", 400);
      }
     req.input = [ String(req.input) ]; // Ensure array of strings
   } else {
-     // Ensure all items in the input array are strings
-     req.input = req.input.map(item => String(item));
+     req.input = req.input.map(item => String(item)); // Ensure all items are strings
+      if (req.input.length === 0) {
+           throw new HttpError("Input array is empty for embeddings.", 400);
+      }
   }
 
 
   // API endpoint is batchEmbedContents for multiple inputs
-  // Or embedContent for single input. batchEmbedContents is more flexible.
   const response = await fetch(`${BASE_URL}/${API_VERSION}/${modelEndpoint}:batchEmbedContents`, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
     body: JSON.stringify({
       "requests": req.input.map(text => ({
-        // model needs to be included in each request for batch endpoint (redundant but required by API)
+        // model needs to be included in each request for batch endpoint
         model: modelEndpoint,
         content: { parts: [{ text }] }, // Input is text parts
         outputDimensionality: req.dimensions, // Optional: specify dimension
-        // Add other potential embedding request parameters if needed
       }))
     })
   });
@@ -194,7 +254,7 @@ async function handleEmbeddings (req, apiKey) {
       responseBodyText = await responseClone.text();
     } catch (e) {
        console.error("Error reading response text:", e);
-       return new Response(response.body, fixCors(response));
+        throw new HttpError("Failed to read response body from Google API: " + e.message, 500);
     }
 
 
@@ -202,20 +262,15 @@ async function handleEmbeddings (req, apiKey) {
     try {
       const data = JSON.parse(responseBodyText);
        if (!data.embeddings || !Array.isArray(data.embeddings)) {
-           // Even on success, API might return empty embeddings or different structure
-           // Check if it's a valid embedding response format
-           if (data.error) {
-               // API returned an error structure despite 200 status? Rare but possible.
-                console.error("Google API error in embeddings JSON body:", data.error);
-                // Return the original error JSON with potentially correct status if available
-                const errorStatus = data.error.code && typeof data.error.code === 'number' ? data.error.code : response.status;
-                return new Response(responseBodyText, fixCors({ status: errorStatus, headers: response.headers }));
-           }
+            if (data.error) {
+                console.error("Google API error in Embeddings JSON body:", data.error);
+                 throw new HttpError(data.error.message || "Google API error during embeddings.", data.error.code || 500, responseBodyText, response.status);
+            }
            throw new Error("Unexpected response format: 'embeddings' array not found or invalid.");
        }
 
       body = JSON.stringify({
-        object: "list", // OpenAI standard list object for embeddings
+        object: "list",
         data: data.embeddings.map(({ values }, index) => ({
           object: "embedding",
           index, // Original index from the input request order
@@ -227,13 +282,23 @@ async function handleEmbeddings (req, apiKey) {
       }, null, "  "); // Pretty print for debugging
     } catch (err) {
         console.error("Error processing embeddings response:", err);
-        // If transformation fails, return the original (potentially error) response body text
-        return new Response(responseBodyText, fixCors(response));
+        if (err instanceof HttpError) throw err;
+        throw new HttpError("Error processing embeddings response from Google API: " + err.message, 500, responseBodyText, response.status);
     }
   } else {
-     // If the original response was not ok, return its body (likely an API error message)
-     body = responseBodyText;
-     // No need to process JSON if status is not ok, just return the error body.
+     console.error("Google API returned error status for embeddings:", response.status, response.statusText, responseBodyText);
+     let errorMessage = response.statusText;
+     try {
+         const errorData = JSON.parse(responseBodyText);
+         if (errorData.error?.message) {
+             errorMessage = errorData.error.message;
+         } else if (errorData.message) {
+             errorMessage = errorData.message;
+         }
+     } catch (parseErr) {
+         console.error("Failed to parse Google API error body for embeddings:", parseErr);
+     }
+      throw new HttpError(errorMessage, response.status, responseBodyText, response.status);
   }
   return new Response(body, fixCors(response));
 }
@@ -248,18 +313,13 @@ async function handleCompletions (req, apiKey) {
       if (req.model.startsWith("models/")) {
           modelName = req.model.substring(7); // Remove 'models/' prefix
       } else {
-          // Assume model name is directly provided (e.g., "gemini-pro", "gemini-2.0-flash-exp-image-generation")
           modelName = req.model;
       }
   }
-  // The actual API call URL will be BASE_URL/API_VERSION/models/{model_name}:TASK
-  // where model_name is just "gemini-pro", "gemini-2.0-flash", etc.
 
   let body = await transformRequest(req); // Transforms OpenAI -> Gemini request body
 
   // Handle specific model suffix requests like "-search-preview" or ":search"
-  // This modifies the request body to include Google Search tool.
-  // Note: This is specific to certain Gemini models/features.
   const originalModelReq = req.model?.toLowerCase() || "";
   const isSearchModel = originalModelReq.endsWith(":search") || originalModelReq.endsWith("-search-preview");
 
@@ -272,7 +332,6 @@ async function handleCompletions (req, apiKey) {
       }
       // Add the Google Search tool to the request body
       body.tools = body.tools || [];
-      // Ensure the tool is only added once
       if (!body.tools.some(tool => tool.googleSearch)) {
          body.tools.push({googleSearch: {}});
       }
@@ -324,8 +383,7 @@ async function handleCompletions (req, apiKey) {
          responseBodyText = await responseClone.text();
       } catch (e) {
          console.error("Error reading non-streaming response text:", e);
-         // If we can't read as text, try returning the original body stream as is
-         return new Response(response.body, fixCors(response));
+         throw new HttpError("Failed to read response body from Google API: " + e.message, 500);
       }
 
 
@@ -333,35 +391,36 @@ async function handleCompletions (req, apiKey) {
         const data = JSON.parse(responseBodyText);
         // Check for expected structure or API errors embedded in JSON
         if (data.error) {
-           // Google API often returns { error: { code, message, status }} for non-200 JSON
-           console.error("Google API error in JSON body:", data.error);
-           // Return the original error JSON with potentially correct status if available
-           const errorStatus = data.error.code && typeof data.error.code === 'number' ? data.error.code : response.status;
-           return new Response(responseBodyText, fixCors({ status: errorStatus, headers: response.headers }));
+           console.error("Google API error in Chat Completions JSON body:", data.error);
+           throw new HttpError(data.error.message || "Google API error during chat completion.", data.error.code || 500, responseBodyText, response.status);
 
         } else if (!data.candidates && !data.promptFeedback) {
-          // Successful response should have candidates array (even if empty) or promptFeedback
-          // If neither is present, it's an unexpected format
           throw new Error("Invalid completion object: missing 'candidates' or 'promptFeedback'.");
         } else {
-           // Transform the Google response object to OpenAI format JSON string
            responseBody = processCompletionsResponse(data, req.model, id);
         }
       } catch (err) {
         console.error("Error parsing or processing non-streaming response:", err);
-        // If parsing or transformation fails, return the original response body text
-        responseBody = responseBodyText; // Return the raw text body
+        if (err instanceof HttpError) throw err;
+        throw new HttpError("Error processing chat completions response from Google API: " + err.message, 500, responseBodyText, response.status);
       }
     }
   } else {
-    // If the initial fetch response was not ok (e.g., 401, 404, 500 status)
-    // Return the original response body directly, which often contains the error details from Google
-    responseBody = response.body;
-    // No need to process JSON if status is not ok, just return the error body.
+     console.error("Google API returned error status for chat completions:", response.status, response.statusText, responseBodyText);
+     let errorMessage = response.statusText;
+     try {
+         const errorData = JSON.parse(responseBodyText);
+         if (errorData.error?.message) {
+             errorMessage = errorData.error.message;
+         } else if (errorData.message) {
+             errorMessage = errorData.message;
+         }
+     } catch (parseErr) {
+         console.error("Failed to parse Google API error body for chat completions:", parseErr);
+     }
+      throw new HttpError(errorMessage, response.status, responseBodyText, response.status);
   }
 
-  // Return the final Response object with the appropriate body and CORS headers.
-  // fixCors ensures CORS headers are present regardless of success/failure status.
   return new Response(responseBody, fixCors(response));
 }
 
@@ -375,7 +434,7 @@ async function handleImageGenerations(req, apiKey) {
     // It will call the Gemini generateContent API with an image generation model.
 
     const prompt = req.prompt;
-    if (typeof prompt !== 'string' || !prompt) {
+    if (typeof prompt !== 'string' || !prompt || prompt.trim().length === 0) {
         throw new HttpError("The 'prompt' field is required and must be a non-empty string.", 400);
     }
 
@@ -388,13 +447,11 @@ async function handleImageGenerations(req, apiKey) {
             role: "user",
             parts: [{ text: prompt }] // Send the prompt as text content
         }],
-        // Add safety settings if desired (already defaulted globally, but can override per request)
-        safetySettings: safetySettings,
-        // Add generation config - Gemini generateContent supports candidateCount (n)
+        safetySettings: safetySettings, // Apply default safety settings
         generationConfig: {
-           candidateCount: req.n !== undefined && typeof req.n === 'number' && req.n >= 1 ? Math.min(req.n, 4) : 1, // Limit n to reasonable number, default 1
-           // Gemini generateContent for image models doesn't have a 'size' parameter.
-           // The model generates images at its native resolution. Ignore req.size.
+           // OpenAI n -> Gemini candidateCount. Limit to 4 as Gemini typically supports up to 4 candidates.
+           candidateCount: req.n !== undefined && typeof req.n === 'number' && req.n >= 1 ? Math.min(Math.floor(req.n), 4) : 1, // Limit n to 1-4, default 1
+           // Gemini generateContent for image models doesn't have a 'size' parameter. Ignore req.size.
         }
         // Tools/tool_config are not applicable for simple image generation via this model
     };
@@ -416,7 +473,7 @@ async function handleImageGenerations(req, apiKey) {
        responseBodyText = await responseClone.text();
     } catch (e) {
         console.error("Error reading image generation response text:", e);
-        return new Response(response.body, fixCors(response));
+        throw new HttpError("Failed to read response body from Google API: " + e.message, 500);
     }
 
 
@@ -426,22 +483,15 @@ async function handleImageGenerations(req, apiKey) {
 
             // Check for Google API errors embedded in JSON
             if (data.error) {
-               console.error("Google API error in image generation JSON body:", data.error);
-                const errorStatus = data.error.code && typeof data.error.code === 'number' ? data.error.code : response.status;
-                return new Response(responseBodyText, fixCors({ status: errorStatus, headers: response.headers }));
-
-            } else if (!data.candidates && !data.promptFeedback) {
-                // If no candidates and no prompt feedback, it's an unexpected successful response
-                 throw new Error("Invalid image generation response: missing 'candidates' or 'promptFeedback'.");
+               console.error("Google API error in Image Generations JSON body:", data.error);
+               throw new HttpError(data.error.message || "Google API error during image generation.", data.error.code || 500, responseBodyText, response.status);
             }
 
              // Handle prompt blocking first
             const choices = [];
             if (checkPromptBlock(choices, data.promptFeedback, "message")) {
                  // If prompt was blocked, checkPromptBlock added a choice with finish_reason: "content_filter"
-                 // We need to format this as an OpenAI image generation error response
-                 // OpenAI image generation errors are typically not in the `choices` format, but a top-level error or specific structure.
-                 // Let's return a structured error response.
+                 // For image generation, translate this to an OpenAI-style error response structure.
                  let errorMessage = data.promptFeedback.blockReason ? `Prompt blocked: ${data.promptFeedback.blockReason}` : "Prompt blocked.";
                  if (data.promptFeedback.safetyRatings) {
                      errorMessage += " Details: " + data.promptFeedback.safetyRatings
@@ -449,14 +499,13 @@ async function handleImageGenerations(req, apiKey) {
                          .map(r => `${r.category} (${r.probability})`)
                          .join(", ");
                  }
-                 throw new HttpError(errorMessage, 400); // Return a 400 error for client
+                 // Throw HttpError which errHandler will format
+                 throw new HttpError(errorMessage, 400, responseBodyText, response.status);
 
-                 // Alternatively, try to mimic an OpenAI-like error response body structure if needed
-                 // return new Response(JSON.stringify({ error: { message: errorMessage, type: "content_filter", code: "prompt_blocked" } }), fixCors({ status: 400 }));
             }
 
             // If not blocked, process candidates (should contain inlineData parts for images)
-            const imageUrls = [];
+            const imageUrls = []; // Array to hold the image objects ({ url: "..." } or { b64_json: "..." })
             if (data.candidates && Array.isArray(data.candidates)) {
                 for (const candidate of data.candidates) {
                     if (candidate.content?.parts && Array.isArray(candidate.content.parts)) {
@@ -486,12 +535,10 @@ async function handleImageGenerations(req, apiKey) {
                 }
             }
 
-            if (imageUrls.length === 0) {
-                // If response was OK but no images were found in parts
-                 console.warn("Google API returned OK for image generation but found no image parts in candidates:", data);
-                 // It might be an empty generation or another issue.
-                 // Return an error or an empty data array? Empty array is more standard for OpenAI success.
-                 // Let's return an empty array if no images were found but the API call was technically OK.
+            if (imageUrls.length === 0 && (!data.candidates || data.candidates.length === 0)) {
+                 // If API returned OK but no candidates with images were found, and it wasn't blocked
+                 console.warn("Google API returned OK for image generation but found no candidates with image parts.");
+                 // Return an empty data array as success, similar to OpenAI behavior for no results.
             }
 
 
@@ -507,20 +554,28 @@ async function handleImageGenerations(req, apiKey) {
 
         } catch (err) {
             console.error("Error parsing or processing image generation response:", err);
-            // If parsing or transformation fails, return the original response body text
-            responseBody = responseBodyText; // Return the raw text body
+            if (err instanceof HttpError) throw err;
+            throw new HttpError("Error processing image generation response from Google API: " + err.message, 500, responseBodyText, response.status);
         }
     } else {
-       // If the initial fetch response was not ok (e.g., 401, 404, 500 status from Google)
-       // Return the original response body directly
-       responseBody = response.body;
+       console.error("Google API returned error status for image generation:", response.status, response.statusText, responseBodyText);
+        let errorMessage = response.statusText;
+        try {
+            const errorData = JSON.parse(responseBodyText);
+            if (errorData.error?.message) {
+                errorMessage = errorData.error.message;
+            } else if (errorData.message) {
+                errorMessage = errorData.message;
+            }
+        } catch (parseErr) {
+            console.error("Failed to parse Google API error body for image generation:", parseErr);
+        }
+       throw new HttpError(errorMessage, response.status, responseBodyText, response.status);
     }
 
     // Return the final Response object with appropriate headers
     return new Response(responseBody, fixCors(response));
 }
-
-// --- END NEW FUNCTION ---
 
 
 // Helper to adjust schema properties for compatibility (e.g., remove additionalProperties: false)
@@ -531,24 +586,21 @@ const adjustProps = (schemaPart) => {
   if (Array.isArray(schemaPart)) {
     schemaPart.forEach(adjustProps);
   } else {
-    // If it's an object with properties and specifically set additionalProperties to false, remove it.
     if (schemaPart.type === "object" && schemaPart.properties && schemaPart.additionalProperties === false) {
       delete schemaPart.additionalProperties;
     }
-    // Recursively process all values (properties in an object, items in an array)
     Object.values(schemaPart).forEach(adjustProps);
   }
 };
-// Helper to adjust the overall function schema structure within a tool definition
 const adjustSchema = (tool) => {
   if (!tool || tool.type !== "function" || !tool.function || !tool.function.parameters) {
-      return; // Not a function tool with parameters
+      return;
   }
   const parameters = tool.function.parameters;
   if (parameters.type === "object" && parameters.strict !== undefined) {
-     delete parameters.strict; // Remove potential 'strict' flag
+     delete parameters.strict;
   }
-  adjustProps(parameters); // Adjust properties within the parameters schema
+  adjustProps(parameters);
 };
 
 const harmCategory = [
@@ -560,10 +612,9 @@ const harmCategory = [
 ];
 const safetySettings = harmCategory.map(category => ({
   category,
-  threshold: "BLOCK_NONE", // Defaulting to BLOCK_NONE
+  threshold: "BLOCK_NONE",
 }));
 
-// Mapping OpenAI request fields to Gemini generationConfig fields
 const fieldsMap = {
   frequency_penalty: "frequencyPenalty",
   max_tokens: "maxOutputTokens",
@@ -571,9 +622,6 @@ const fieldsMap = {
   seed: "seed",
   top_k: "topK",
   top_p: "topP",
-  // n (candidateCount) is handled separately based on streaming
-  // stop (stopSequences) is handled separately
-  // response_format is handled separately
 };
 
 const transformConfig = (req) => {
@@ -588,9 +636,7 @@ const transformConfig = (req) => {
   if (req.stop !== undefined) {
       cfg.stopSequences = Array.isArray(req.stop) ? req.stop : [req.stop];
   }
-  // Handle n (candidateCount): Only apply if not streaming, as streaming only supports 1.
   if (req.n !== undefined && !req.stream) {
-      // Ensure n is a number and at least 1
       if (typeof req.n === 'number' && req.n >= 1) {
           cfg.candidateCount = req.n;
       } else {
@@ -614,8 +660,6 @@ const transformConfig = (req) => {
         // eslint-disable-next-line no-fallthrough
       case "json_object":
         cfg.responseMimeType = "application/json";
-        // If json_object, ideally provide a minimal schema if none exists and model requires it.
-        // For now, just setting mime type.
         break;
       case "text":
         cfg.responseMimeType = "text/plain";
@@ -638,8 +682,6 @@ const parseImg = async (url) => {
       mimeType = response.headers.get("content-type");
       if (!mimeType || !mimeType.startsWith('image/')) {
            console.warn(`Warning: Fetched URL (${url}) did not return an image Content-Type (${mimeType || 'none'}). Attempting to process.`);
-           // Try to guess based on extension or default? Or require? Let's allow it but warn.
-           // If mimeType is null, default to a generic binary type.
            if (!mimeType) mimeType = 'application/octet-stream';
       }
       data = Buffer.from(await response.arrayBuffer()).toString("base64");
@@ -667,7 +709,6 @@ const parseImg = async (url) => {
 };
 
 
-// Transforms OpenAI assistant 'tool_calls' into Gemini 'functionCall' parts.
 const transformFnCalls = ({ tool_calls }) => {
   const callsMapping = {}; // Map tool_call_id -> function.name
   const parts = tool_calls.map(({ function: { arguments: argstr, name }, id, type }, i) => {
@@ -684,18 +725,15 @@ const transformFnCalls = ({ tool_calls }) => {
     callsMapping[id] = name; // Store the mapping for potential subsequent 'tool' messages
     return {
       functionCall: {
-        // Google API functionCall part uses 'name' and 'args'. 'id' is not typically included here.
         name,
         args,
       }
     };
   });
-   // Attach the mapping to the parts array for potential use by subsequent 'tool' messages
   parts.callsMapping = callsMapping;
   return parts;
 };
 
-// Transforms OpenAI `messages` array into Gemini `contents` array and `system_instruction`.
 const transformMessages = async (messages) => {
   if (!messages || !Array.isArray(messages)) {
       if (messages === undefined) return { contents: [] };
@@ -711,43 +749,32 @@ const transformMessages = async (messages) => {
 
     switch (message.role) {
       case "system":
-         // system message content is always string in OpenAI chat completions
          if (typeof message.content === 'string' && message.content.trim().length > 0) {
-             // Add text part(s) from system message to system_instruction accumulator
              system_instruction_parts.push({ text: message.content });
          } else {
              console.warn("Skipping empty or invalid system message content.");
          }
-        continue; // Skip adding system message to contents array
+        continue;
 
       case "tool": {
-        // Tool message is the result of a function call from the assistant.
-        // It corresponds to a 'functionResponse' part in the *user's* content turn.
         if (!message.tool_call_id) {
              throw new HttpError("tool_call_id is required for messages with role 'tool'.", 400);
         }
-        // Need the function name associated with this tool_call_id from the *preceding assistant message*.
         const functionName = lastAssistantToolCallsMapping[message.tool_call_id];
         if (!functionName) {
-             // This is a strict requirement for mapping to Gemini functionResponse
              throw new HttpError(`Function name not found for tool_call_id "${message.tool_call_id}". Ensure the immediately preceding assistant message contained this tool_call_id.`, 400);
         }
 
         let responseData;
         try {
-            // Content of a tool message is the stringified JSON result.
             responseData = JSON.parse(message.content);
         } catch (err) {
              console.error("Error parsing tool message content:", err);
              throw new HttpError("Invalid content in tool message (not valid JSON).", 400);
         }
 
-        // The 'tool' message itself *is* the user's turn responding to the call.
-        // Create a new 'user' content entry specifically for this function response.
-        // This matches Google API examples where user turn can have functionResponse parts.
-        // Note: OpenAI 'tool' messages only have role, tool_call_id, content. No other parts.
         contents.push({
-            role: "user",
+            role: "user", // Tool response is part of the user's turn
             parts: [{
                  functionResponse: {
                     name: functionName,
@@ -756,68 +783,53 @@ const transformMessages = async (messages) => {
             }]
         });
 
-        lastAssistantToolCallsMapping = {}; // Reset mapping after a user turn
-        break; // Processed tool message, continue to next item
+        lastAssistantToolCallsMapping = {}; // Reset mapping after a user turn (or tool turn responding for user)
+        break;
 
-      } // end case "tool"
-
+      }
 
       case "assistant":
-        message.role = "model"; // Transform role for Google API
+        message.role = "model";
 
         if (message.tool_calls && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-             // Transform OpenAI tool_calls into Gemini functionCall parts
              const toolCallParts = transformFnCalls(message);
              message.parts = toolCallParts;
-             // Store the mapping from this assistant message's tool calls for the *next* tool message
              lastAssistantToolCallsMapping = toolCallParts.callsMapping || {};
 
-             // OpenAI spec: 'content' is required unless tool_calls is specified.
-             // If tool_calls are present, 'content' should typically be null or empty.
-             // If it exists and is not empty, decide whether to include it.
              if (message.content !== undefined && message.content !== null && message.content !== "") {
                  console.warn("Assistant message has both tool_calls and non-empty content. Prioritizing tool_calls and ignoring content.");
-                 // If you needed to include the text content alongside function calls,
-                 // you'd need to process message.content (string or array) here
-                 // and add its parts to message.parts array.
              }
-             delete message.content; // Remove the OpenAI 'content' field
+             delete message.content;
 
         } else {
-             // Process standard text/image content for assistant message
-             message.parts = await transformMsgContent(message); // Handles array or string content
-             lastAssistantToolCallsMapping = {}; // Reset mapping as this message has no tool calls
-             delete message.content; // Remove the OpenAI 'content' field
+             message.parts = await transformMsgContent(message);
+             lastAssistantToolCallsMapping = {};
+             delete message.content;
         }
-         // Add the transformed message to contents
         contents.push({
             role: message.role,
             parts: message.parts
         });
-        break; // Done with assistant message
+        break;
 
       case "user":
-        message.role = "user"; // Role is already correct
+        message.role = "user";
 
-        // Process content for user message (handles array of text/image/audio)
         message.parts = await transformMsgContent(message);
 
-         // If the user message content was empty after transformation (e.g., empty string or empty array),
-         // Google API might require a minimal part. Add an empty text part.
          if (!message.parts || message.parts.length === 0) {
-             message.parts = [{ text: "" }]; // Add a minimal text part
+             message.parts = [{ text: "" }];
              console.warn("Empty user message content received, adding empty text part.");
          }
 
-         delete message.content; // Remove the OpenAI 'content' field
-        lastAssistantToolCallsMapping = {}; // Reset mapping after a user turn
+         delete message.content;
+        lastAssistantToolCallsMapping = {};
 
-        // Add the transformed message to contents
         contents.push({
             role: message.role,
             parts: message.parts
         });
-        break; // Done with user message
+        break;
 
 
       default:
@@ -825,20 +837,13 @@ const transformMessages = async (messages) => {
     }
   }
 
-  // Finalize system_instruction
   let system_instruction = system_instruction_parts.length > 0 ? { parts: system_instruction_parts } : undefined;
 
 
-  // Google API requires the first `contents` entry to be `user` if system_instruction is present,
-  // or if there's no system instruction but history starts with model.
-  // Ensure the very first actual content entry is 'user'.
-  // This is a common requirement for turn-based models.
   if (contents.length > 0 && contents[0].role !== "user") {
-      // Add a dummy user turn at the beginning if the history doesn't start with user.
       contents.unshift({ role: "user", parts: [{ text: "" }] });
   }
 
-  // Clean up the `parts.callsMapping` helper property from parts arrays
   contents.forEach(content => {
       if (content.parts && Array.isArray(content.parts)) {
            delete content.parts.callsMapping;
@@ -851,34 +856,30 @@ const transformMessages = async (messages) => {
   return { system_instruction, contents };
 };
 
-// Transforms the 'content' field of an OpenAI message item (string or array)
-// into an array of Gemini `parts`. Handles text, image_url, input_audio.
 const transformMsgContent = async (message) => {
   const parts = [];
-  const content = message.content; // Get the content field
+  const content = message.content;
 
   if (content === null || content === undefined || (Array.isArray(content) && content.length === 0)) {
-      return parts; // Return empty parts array for null, undefined, or empty array content
+      return parts;
   }
 
   if (!Array.isArray(content)) {
-    // Simple case: content is a string (for user or assistant text messages)
-    parts.push({ text: String(content) }); // Ensure it's a string part
+    parts.push({ text: String(content) });
     return parts;
   }
 
-  // Complex case: content is an array of objects (for user messages with mixed content)
   let hasText = false;
   for (const item of content) {
     if (typeof item !== 'object' || item === null) {
         console.warn("Unexpected item type in message content array:", item);
-        continue; // Skip invalid items
+        continue;
     }
     switch (item.type) {
       case "text":
         if (typeof item.text === 'string') {
             parts.push({ text: item.text });
-            hasText = true; // Flag that text was found
+            hasText = true;
         } else {
             console.warn("Invalid text part: text field is not a string.", item);
         }
@@ -908,20 +909,15 @@ const transformMsgContent = async (message) => {
              throw new HttpError("Invalid input_audio part: missing 'format' or 'data'.", 400);
         }
         break;
-      // Add other known OpenAI content types if needed (e.g., image_file, etc.)
       default:
         console.warn(`Unknown or unsupported "content" item type (skipping): "${item.type}"`);
-        // throw new HttpError(`Unknown "content" item type: "${item.type}"`, 400); // Or skip?
     }
   }
 
-   // Google API sometimes requires a text part in a user turn if it contains other modalities (like images)
-   // or if it contains *only* images/audio. Add an empty text part if no text was present initially.
   if (parts.length > 0 && !hasText) {
-       // Double check if any part is actually a text part after processing
        const hasExistingTextPart = parts.some(p => p.text !== undefined);
        if (!hasExistingTextPart) {
-           parts.push({ text: "" }); // Add an empty text part if none exists
+           parts.push({ text: "" });
        }
   }
 
@@ -937,7 +933,7 @@ const transformTools = (req) => {
          funcs.forEach(adjustSchema);
          tools = [{ function_declarations: funcs.map(tool => tool.function) }];
     } else {
-         tools = []; // Send empty tools array if no function tools
+         tools = [];
     }
   } else if (req.tools !== undefined && req.tools !== null) {
        console.warn("Request 'tools' field is not an array. Ignoring.");
@@ -968,7 +964,6 @@ const transformTools = (req) => {
 };
 
 
-// Combines transformations for the full chat completions request body
 const transformRequest = async (req) => {
     const { system_instruction, contents } = await transformMessages(req.messages);
     const generationConfig = transformConfig(req);
@@ -978,7 +973,7 @@ const transformRequest = async (req) => {
         contents,
         ...(system_instruction && { system_instruction }),
         generationConfig,
-        safetySettings, // Apply default safety settings
+        safetySettings,
         ...(tools && tools.length > 0 && { tools }),
         ...(tool_config && { tool_config }),
     };
@@ -1003,46 +998,38 @@ const reasonsMap = {
   "SAFETY": "content_filter",
   "RECITATION": "content_filter",
   "OTHER": "other",
-   // Add others if needed, like "TOOL_FUNCTION_CALL" if Google API uses it as a distinct finishReason
 };
 
-// Transforms a single Gemini candidate object (from non-streaming response)
-// into an OpenAI-like choice object for chat completions.
 const transformMessageResponse = (cand) => {
   const message = {
       role: "assistant",
-      content: [], // Content is an array of parts in OpenAI spec for multimodal
-      // tool_calls: undefined
+      content: [],
   };
   let hasFunctionCall = false;
 
   if (cand.content?.parts && Array.isArray(cand.content.parts)) {
       const tool_calls = [];
-      const content_parts = []; // For text and image_url
+      const content_parts = [];
 
       for (const part of cand.content.parts) {
           if (part.text !== undefined) {
               content_parts.push({ type: "text", text: part.text });
           } else if (part.inlineData !== undefined) {
-               // Handle inline image data
                if (part.inlineData.mimeType && part.inlineData.data) {
-                    // Gemini image response in chat comes as inlineData
                     content_parts.push({
                         type: "image_url",
                         image_url: {
                             url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
-                            // detail: "auto" // Optional
                         }
                     });
                } else {
                    console.warn("Skipping invalid inlineData part in candidate:", part.inlineData);
                }
           } else if (part.functionCall !== undefined) {
-              // Handle function call part
               const fc = part.functionCall;
               if (fc.name && fc.args !== undefined) {
                    tool_calls.push({
-                       id: fc.id ?? "call_" + generateId(), // Use Google ID or generate OpenAI-like
+                       id: fc.id ?? "call_" + generateId(),
                        type: "function",
                        function: {
                            name: fc.name,
@@ -1054,55 +1041,41 @@ const transformMessageResponse = (cand) => {
                    console.warn("Skipping invalid functionCall part in candidate:", part.functionCall);
               }
           }
-           // Ignore other part types (like functionResponse in a model response)
       }
 
-      message.content = content_parts.length > 0 ? content_parts : null; // Use null if no text/image parts
+      message.content = content_parts.length > 0 ? content_parts : null;
       if (tool_calls.length > 0) {
-          message.tool_calls = tool_calls; // Add tool_calls array if function calls were found
+          message.tool_calls = tool_calls;
       }
   } else {
-       // If no content or parts array, message content is null
        message.content = null;
   }
 
-
   let finish_reason = reasonsMap[cand.finishReason] || cand.finishReason || null;
 
-  // If the message includes tool_calls, the finish reason is typically "tool_calls" in OpenAI format
   if (hasFunctionCall) {
       finish_reason = "tool_calls";
   }
 
-
   return {
-    index: cand.index || 0, // Ensure index is present (default 0)
+    index: cand.index || 0,
     message: message,
-    logprobs: null, // Not available
+    logprobs: null,
     finish_reason: finish_reason,
-    // original_finish_reason: cand.finishReason, // Optional
   };
 };
 
-// Transforms a single Gemini candidate object (from streaming chunk)
-// into an OpenAI-like delta object for a stream chunk in chat completions.
 const transformDeltaResponse = (cand) => {
-    const delta = {
-        // role: "assistant", // Role is typically only in the first delta chunk for a candidate
-        // content: [], // Initialize delta content array (will be added if parts exist)
-        // tool_calls: undefined // Initialize delta tool_calls array (will be added if parts exist)
-    };
-    let hasFunctionCall = false; // Flag if this chunk contains function calls
+    const delta = {}; // Start with an empty delta
 
      if (cand.content?.parts && Array.isArray(cand.content.parts)) {
         const delta_tool_calls = [];
-        const delta_content_parts = []; // For text and image_url
+        const delta_content_parts = [];
 
         for (const part of cand.content.parts) {
             if (part.text !== undefined) {
                  delta_content_parts.push({ type: "text", text: part.text });
             } else if (part.inlineData !== undefined) {
-                 // Handle inline image data in delta (full part likely in one chunk)
                  if (part.inlineData.mimeType && part.inlineData.data) {
                      delta_content_parts.push({
                          type: "image_url",
@@ -1114,7 +1087,6 @@ const transformDeltaResponse = (cand) => {
                      console.warn("Skipping invalid inlineData part in stream chunk:", part.inlineData);
                  }
             } else if (part.functionCall !== undefined) {
-                 // Handle function call part in delta (full call likely in one chunk)
                  const fc = part.functionCall;
                  if (fc.name && fc.args !== undefined) {
                      delta_tool_calls.push({
@@ -1125,42 +1097,34 @@ const transformDeltaResponse = (cand) => {
                               arguments: JSON.stringify(fc.args),
                           }
                      });
-                     hasFunctionCall = true;
                  } else {
                       console.warn("Skipping invalid functionCall part in stream chunk:", part.functionCall);
                  }
             }
-            // Ignore other part types
         }
 
         if (delta_content_parts.length > 0) {
-            delta.content = delta_content_parts; // Add content array if parts exist
+            delta.content = delta_content_parts;
         }
 
         if (delta_tool_calls.length > 0) {
-             delta.tool_calls = delta_tool_calls; // Add tool_calls array if function calls exist
+             delta.tool_calls = delta_tool_calls;
         }
      }
 
-    // Determine finish reason for this chunk (only present in the final chunk)
     let finish_reason = reasonsMap[cand.finishReason] || cand.finishReason || null;
 
-    // Return the transformed choice delta object
     return {
-        index: cand.index || 0, // Ensure index is present (default 0)
+        index: cand.index || 0,
         delta: delta,
-        finish_reason: finish_reason, // Includes finish reason if present in chunk
-        // logprobs: null, // Not in delta
-        // original_finish_reason: cand.finishReason, // Optional
+        finish_reason: finish_reason,
     };
 };
 
 
-// Checks for prompt blocking feedback and adds a content filter choice if blocked
-// This function is used for BOTH non-streaming (key="message") and streaming (key="delta")
 const checkPromptBlock = (choices, promptFeedback, key) => {
   if (choices.length > 0) {
-      return false; // Already have choices, not a full block scenario
+      return false;
   }
 
   if (promptFeedback?.blockReason) {
@@ -1171,116 +1135,88 @@ const checkPromptBlock = (choices, promptFeedback, key) => {
         .forEach(r => console.log(`- Safety Category: ${r.category}, Probability: ${r.probability}, Blocked: ${r.blocked}`));
     }
 
-    // Add a single choice indicating content filtering
     choices.push({
-      index: 0, // Always index 0 for the single blocked choice
-      // Add the appropriate field based on whether it's streaming or non-streaming
-      [key]: (key === "message") ? null : {}, // message is null, delta is empty object {}
-      finish_reason: "content_filter", // Standard OpenAI reason
-      // original_finish_reason: promptFeedback.blockReason, // Optional
+      index: 0,
+      [key]: (key === "message") ? null : {},
+      finish_reason: "content_filter",
     });
-    return true; // Indicate that the prompt was blocked
+    return true;
   }
-  return false; // Indicate that the prompt was not blocked
+  return false;
 };
 
 
-// Processes the full non-streaming response body from Google API for chat completions
-// Transforms it into the OpenAI chat completion JSON string.
 const processCompletionsResponse = (data, model, id) => {
   const obj = {
     id,
-    choices: [], // Initialize choices array
+    choices: [],
     created: Math.floor(Date.now()/1000),
-    // Report the model name without "models/" prefix, as typically done by OpenAI
     model: model.startsWith("models/") ? model.substring(7) : model,
-    // system_fingerprint: data.system_fingerprint ?? "fp_unknown",
-    object: "chat.completion", // Standard OpenAI object type
-    // usage: ... // Added after checking for prompt block
+    object: "chat.completion",
   };
 
-  // Process candidates if they exist
   if (data.candidates && Array.isArray(data.candidates)) {
      obj.choices = data.candidates.map(transformMessageResponse);
   } else {
       console.warn("Google API response missing 'candidates' array for non-streaming chat completion.");
-      obj.choices = []; // Ensure choices is an array even if missing
+      obj.choices = [];
   }
 
-
-  // Check for prompt blocking *after* attempting to transform candidates.
-  // If the prompt was blocked, this function will add a content_filter choice.
   checkPromptBlock(obj.choices, data.promptFeedback, "message");
 
-
-  // Add usage metadata if available
   if (data.usageMetadata) {
     obj.usage = transformUsage(data.usageMetadata);
   } else if (data.promptFeedback?.tokenCount) {
-      // If prompt was blocked, prompt token count might be in promptFeedback
        obj.usage = { prompt_tokens: data.promptFeedback.tokenCount, completion_tokens: 0, total_tokens: data.promptFeedback.tokenCount };
   } else {
-      obj.usage = undefined; // or null;
+      obj.usage = undefined;
   }
 
-  return JSON.stringify(obj); // Compact JSON output
+  return JSON.stringify(obj);
 };
 
-// Transforms Google API usageMetadata to OpenAI usage object
 const transformUsage = (data) => {
   const usage = {
     prompt_tokens: data.promptTokenCount ?? 0,
     completion_tokens: data.candidatesTokenCount ?? 0,
     total_tokens: data.totalTokenCount ?? 0,
   };
-   // Ensure fields are numbers
    Object.keys(usage).forEach(key => { usage[key] = Number(usage[key]) || 0; });
    return usage;
 };
 
 
-// --- Streaming Transform Functions ---
-
-// Regex to parse Server-Sent Events 'data:' lines
 const responseLineRE_single = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
 
-// TransformStream for parsing SSE data chunks.
 function parseStream (chunk, controller) {
   this.buffer += chunk;
   let match;
   while ((match = this.buffer.match(responseLineRE_single)) !== null) {
     controller.enqueue(match[1]);
-    // Important: Use slice on the underlying buffer and convert back to string for efficiency
     this.buffer = this.buffer.buffer.slice(match[0].length).toString();
   }
 }
 
-// Flush function for parseStream. Handles any remaining data.
 function parseStreamFlush (controller) {
   if (this.buffer.length > 0) {
     console.error("parseStream: Remaining data in buffer after flush:", this.buffer);
     controller.enqueue(this.buffer);
-    this.shared.is_buffers_rest = true; // Indicate leftover data
+    this.shared.is_buffers_rest = true;
   }
-  this.buffer = ""; // Clear buffer
+  this.buffer = "";
 }
 
-// Delimiter for SSE messages
 const delimiter = "\n\n";
 
-// Helper to format an object into an SSE 'data:' line
 const sseline = (obj) => {
   const dataString = JSON.stringify(obj);
   return `data: ${dataString}${delimiter}`;
 };
 
-// TransformStream for transforming Google API stream chunks (parsed JSON)
-// into OpenAI API stream chunks (SSE 'data:' lines) for chat completions.
 function toOpenAiStream (line, controller) {
   let data;
   try {
     data = JSON.parse(line);
-    // Check for Google API errors embedded in the stream
     if (data.error) {
         console.error("Google API stream error chunk:", data.error);
         const errorChunk = {
@@ -1291,40 +1227,35 @@ function toOpenAiStream (line, controller) {
             choices: [{
                 index: 0,
                 delta: { role: "assistant" },
-                finish_reason: "tool_error", // Or map a more specific error reason?
+                finish_reason: "tool_error",
             }],
-            error: { // Include error details in the chunk
+            error: {
                 message: data.error.message || "An error occurred during streaming.",
                 type: data.error.status || "api_error",
                 code: data.error.code,
              },
         };
         controller.enqueue(sseline(errorChunk));
-        controller.enqueue("data: [DONE]" + delimiter); // Signal end of stream
+        controller.enqueue("data: [DONE]" + delimiter);
         return;
     }
-     // A valid chunk fragment should typically have 'candidates' or 'promptFeedback'
     if (!data.candidates && !data.promptFeedback) {
        if (this.shared.is_buffers_rest && line.trim().length > 0) {
            console.warn("toOpenAiStream: Ignoring potentially incomplete or malformed chunk:", line);
        } else {
            console.warn("toOpenAiStream: Unexpected Google API stream chunk format:", data);
-           // Decide whether to throw or skip. Skipping is more resilient.
        }
-       return; // Skip processing this chunk
+       return;
     }
 
   } catch (err) {
     console.error("toOpenAiStream: Error parsing JSON line:", err, "Line:", line);
     if (!this.shared.is_buffers_rest || line.trim().length > 0) {
-        // Throwing is usually better for signaling critical stream errors
         controller.error(new Error("Failed to parse stream chunk JSON: " + err.message));
-        // Or enqueue an error chunk and DONE... decide on error handling strategy
     }
-    return; // Skip if it was just leftover buffer
+    return;
   }
 
-  // Handle prompt blocking feedback received in a chunk
   if (data.promptFeedback) {
       const choices = [];
       if (checkPromptBlock(choices, data.promptFeedback, "delta")) {
@@ -1333,81 +1264,61 @@ function toOpenAiStream (line, controller) {
              object: "chat.completion.chunk",
              created: Math.floor(Date.now()/1000),
              model: this.model.startsWith("models/") ? this.model.substring(7) : this.model,
-             choices: choices, // Contains the single blocked choice ({ index: 0, delta: {}, finish_reason: "content_filter" })
-             // Usage might be included here
+             choices: choices,
              usage: data.promptFeedback.tokenCount ? { prompt_tokens: data.promptFeedback.tokenCount, completion_tokens: 0, total_tokens: data.promptFeedback.tokenCount } : undefined,
           };
            controller.enqueue(sseline(blockChunk));
-           controller.enqueue("data: [DONE]" + delimiter); // Signal end of stream
+           controller.enqueue("data: [DONE]" + delimiter);
            return;
       }
-       // If promptFeedback is present but not a block, and no candidates, skip
        if (!data.candidates) {
            console.warn("toOpenAiStream: Chunk contains promptFeedback but no candidates and is not a block.", data);
            return;
        }
   }
 
-
-  // Process candidates (should be an array, typically with 1 candidate in streaming)
   if (data.candidates && Array.isArray(data.candidates)) {
     const openaiChoices = data.candidates.map(transformDeltaResponse);
 
     openaiChoices.forEach(choice => {
         const index = choice.index || 0;
-        // Initialize state for this candidate index if it's the first chunk for it
         if (!this.last[index]) {
             this.last[index] = { delta: {}, finish_reason: null };
         }
 
-        // OpenAI stream format: role only in the very first chunk (index 0, first in stream)
         if (index === 0 && Object.keys(this.last[index].delta).length === 0 && !choice.delta.role) {
-             choice.delta = choice.delta || {}; // Ensure delta exists
-             choice.delta.role = "assistant"; // Add role to the first chunk of the first candidate
+             choice.delta = choice.delta || {};
+             choice.delta.role = "assistant";
         }
 
-        // Update accumulated state for finish reason
         if (choice.finish_reason) {
             this.last[index].finish_reason = choice.finish_reason;
         }
 
-        // Enqueue the transformed OpenAI chunk
         const openaiChunk = {
            id: this.id,
            object: "chat.completion.chunk",
            created: Math.floor(Date.now()/1000),
            model: this.model.startsWith("models/") ? this.model.substring(7) : this.model,
-           choices: [choice], // Each OpenAI chunk has a 'choices' array with one item
-           // Usage metadata is typically in the final chunk. Add it here if requested and available.
+           choices: [choice],
            usage: data.usageMetadata && this.streamIncludeUsage ? transformUsage(data.usageMetadata) : undefined,
         };
 
-         // Only enqueue if the delta has content/tool_calls, or it's the first chunk (role), or it has finish reason/usage
          const deltaHasMeaningfulContent = choice.delta && (Object.keys(choice.delta).length > 0 || choice.delta.role);
          const chunkHasFinishReasonOrUsage = choice.finish_reason || openaiChunk.usage;
 
          if (deltaHasMeaningfulContent || chunkHasFinishReasonOrUsage) {
              controller.enqueue(sseline(openaiChunk));
-         } else {
-             // console.log(`Skipping empty chunk for index ${index}:`, openaiChunk);
          }
-
     });
 
   } else {
       console.warn("toOpenAiStream: Chunk missing 'candidates' array and not a prompt block:", data);
-      // Skip processing this chunk
   }
 }
 
-// Flush function for toOpenAiStream. Sends the final [DONE] signal.
 function toOpenAiStreamFlush (controller) {
-  // After processing all chunks, send the final [DONE] signal.
   controller.enqueue("data: [DONE]" + delimiter);
-
-  // Clean up state (optional, but good practice)
   this.last = [];
   this.shared = {};
 }
-
-// --- END OF RESPONSE PROCESSING AND STREAMING ---
