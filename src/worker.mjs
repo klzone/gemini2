@@ -7,82 +7,30 @@ export default {
     }
     const errHandler = (err) => {
       console.error(err);
-      // Check if err is an HttpError and return its status, otherwise use 500
-      const status = (err instanceof HttpError) ? err.status : (err.status ?? 500);
-      // Include Google API error details if available in the original error
-       let message = err.message;
-       if (err.originalResponseText) {
-           try {
-               const originalError = JSON.parse(err.originalResponseText);
-               if (originalError.error?.message) {
-                   // Prefer Google's detailed error message if present
-                   message = originalError.error.message;
-               } else if (originalError.message) {
-                   // Fallback to a non-standard top-level message
-                    message = originalError.message;
-               }
-           } catch (parseErr) {
-               // If original response text isn't JSON, just use the current message
-               console.error("Failed to parse original response text for error details:", parseErr);
-           }
-       }
-
-
-      // Structure the error response body similar to OpenAI's error object
-      const errorBody = {
-           error: {
-               message: message || "An unknown error occurred.",
-               type: (err instanceof HttpError) ? "api_error" : "internal_error", // Categorize errors
-               code: status, // Use the HTTP status code as the error code
-               // Include original Google API status if it's an HttpError that wrapped a response
-               ...(err.originalResponseStatus && { original_status: err.originalResponseStatus }),
-               // Add other details if needed, e.g., specific Google error codes
-           }
-      };
-
-      return new Response(JSON.stringify(errorBody), fixCors({ status }));
+      return new Response(err.message, fixCors({ status: err.status ?? 500 }));
     };
     try {
       const auth = request.headers.get("Authorization");
       const apiKey = auth?.split(" ")[1];
-      const assert = (success, message, status = 400) => {
+      const assert = (success) => {
         if (!success) {
-          throw new HttpError(message, status);
+          throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
         }
       };
       const { pathname } = new URL(request.url);
-
-      // Normalize pathname by removing potential leading /v1 if present
-      // This makes the endsWith checks work regardless of whether the client
-      // includes /v1 in the base URL or the path.
-      const normalizedPathname = pathname.startsWith('/v1') ? pathname.substring(3) : pathname;
-
-
       switch (true) {
-        // Handles chat models (including multimodal like image generation through chat)
-        case normalizedPathname.endsWith("/chat/completions"):
-          assert(request.method === "POST", "Method Not Allowed", 405);
+        case pathname.endsWith("/chat/completions"):
+          assert(request.method === "POST");
           return handleCompletions(await request.json(), apiKey)
             .catch(errHandler);
-
-        // Handles embeddings models
-        case normalizedPathname.endsWith("/embeddings"):
-          assert(request.method === "POST", "Method Not Allowed", 405);
+        case pathname.endsWith("/embeddings"):
+          assert(request.method === "POST");
           return handleEmbeddings(await request.json(), apiKey)
             .catch(errHandler);
-
-        // Handles listing models
-        case normalizedPathname.endsWith("/models"):
-          assert(request.method === "GET", "Method Not Allowed", 405);
+        case pathname.endsWith("/models"):
+          assert(request.method === "GET");
           return handleModels(apiKey)
             .catch(errHandler);
-
-        // Handles OpenAI-style image generation endpoint
-        case normalizedPathname.endsWith("/images/generations"):
-          assert(request.method === "POST", "Method Not Allowed", 405);
-          return handleImageGenerations(await request.json(), apiKey)
-             .catch(errHandler);
-
         default:
           throw new HttpError("404 Not Found", 404);
       }
@@ -93,25 +41,16 @@ export default {
 };
 
 class HttpError extends Error {
-  constructor(message, status, originalResponseText = null, originalResponseStatus = null) {
+  constructor(message, status) {
     super(message);
     this.name = this.constructor.name;
     this.status = status;
-    this.originalResponseText = originalResponseText; // Store original response body text if available
-    this.originalResponseStatus = originalResponseStatus; // Store original response status if available
   }
 }
 
 const fixCors = ({ headers, status, statusText }) => {
   headers = new Headers(headers);
   headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Access-Control-Allow-Methods", "*"); // Allow all methods for simplicity
-  headers.set("Access-Control-Allow-Headers", "*"); // Allow all headers for simplicity
-  headers.set("Content-Type", "application/json"); // Assume JSON response for most cases
-
-  // Add specific headers if needed
-  // headers.set("Cache-Control", "no-cache, must-revalidate");
-
   return { headers, status, statusText };
 };
 
@@ -119,17 +58,17 @@ const handleOPTIONS = async () => {
   return new Response(null, {
     headers: {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "*", // Allow all methods for simplicity
-      "Access-Control-Allow-Headers": "*", // Allow all headers for simplicity
+      "Access-Control-Allow-Methods": "*",
+      "Access-Control-Allow-Headers": "*",
     }
   });
 };
 
 const BASE_URL = "https://generativelanguage.googleapis.com";
-const API_VERSION = "v1beta"; // Use v1beta for broad model support
+const API_VERSION = "v1beta";
 
 // https://github.com/google-gemini/generative-ai-js/blob/cf223ff4a1ee5a2d944c53cddb8976136382bee6/src/requests/request.ts#L71
-const API_CLIENT = "genai-js/0.21.0"; // Use a recent version or the one you prefer
+const API_CLIENT = "genai-js/0.21.0"; // npm view @google/generative-ai version
 const makeHeaders = (apiKey, more) => ({
   "x-goog-api-client": API_CLIENT,
   ...(apiKey && { "x-goog-api-key": apiKey }),
@@ -140,445 +79,136 @@ async function handleModels (apiKey) {
   const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
     headers: makeHeaders(apiKey),
   });
-  let body;
-  const responseClone = response.clone();
-  let responseBodyText;
-
-  try {
-    responseBodyText = await responseClone.text();
-  } catch (e) {
-    console.error("Error reading response text:", e);
-     // Wrap fetch error in HttpError
-    throw new HttpError("Failed to read response body from Google API: " + e.message, 500);
-  }
-
+  let { body } = response;
   if (response.ok) {
-    try {
-      const data = JSON.parse(responseBodyText);
-       if (!data.models || !Array.isArray(data.models)) {
-            // Check if it's an error structure despite 200 status
-            if (data.error) {
-               console.error("Google API error in Models JSON body:", data.error);
-               // Re-throw as HttpError to be caught by errHandler
-                throw new HttpError(data.error.message || "Google API error listing models.", data.error.code || 500, responseBodyText, response.status);
-            }
-            throw new Error("Unexpected response format: 'models' array not found or invalid.");
-       }
-
-      body = JSON.stringify({
-        object: "list",
-        data: data.models.map(({ name }) => ({
-          id: name.replace("models/", ""),
-          object: "model",
-          created: 0, // Static, as original API doesn't provide timestamp
-          owned_by: "google",
-        })),
-      }, null, "  "); // Pretty print for debugging
-    } catch (err) {
-      console.error("Error processing models response:", err);
-       // If transformation fails, wrap in HttpError
-       // If err is already HttpError (from recursive check), re-throw it
-       if (err instanceof HttpError) throw err;
-      throw new HttpError("Error processing models response from Google API: " + err.message, 500, responseBodyText, response.status);
-    }
-  } else {
-     // If the original response was not ok, wrap the error details
-      console.error("Google API returned error status for models:", response.status, response.statusText, responseBodyText);
-      // Try to parse for a more specific message, otherwise use status text
-      let errorMessage = response.statusText;
-      try {
-          const errorData = JSON.parse(responseBodyText);
-          if (errorData.error?.message) {
-              errorMessage = errorData.error.message;
-          } else if (errorData.message) {
-              errorMessage = errorData.message;
-          }
-      } catch (parseErr) {
-          console.error("Failed to parse Google API error body for models:", parseErr);
-          // Use default statusText if parsing fails
-      }
-       throw new HttpError(errorMessage, response.status, responseBodyText, response.status);
+    const { models } = JSON.parse(await response.text());
+    body = JSON.stringify({
+      object: "list",
+      data: models.map(({ name }) => ({
+        id: name.replace("models/", ""),
+        object: "model",
+        created: 0,
+        owned_by: "",
+      })),
+    }, null, "  ");
   }
-
-  // Return the transformed body or the original error body with CORS headers
   return new Response(body, fixCors(response));
 }
 
-
 const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-004";
 async function handleEmbeddings (req, apiKey) {
-  // req is the parsed JSON request body from the client
-
-  let modelName = req.model; // Get the model name from the request
-
-  if (typeof modelName !== "string" || !modelName) {
-     console.warn(`Model not specified or invalid for embeddings. Using default: ${DEFAULT_EMBEDDINGS_MODEL}`);
-     modelName = DEFAULT_EMBEDDINGS_MODEL;
+  if (typeof req.model !== "string") {
+    throw new HttpError("model is not specified", 400);
   }
-
-   // Ensure the model name has the 'models/' prefix for the Google API endpoint
-  const modelEndpoint = modelName.startsWith("models/") ? modelName : "models/" + modelName;
-
-  // Input can be a string or array of strings
-  if (!Array.isArray(req.input)) {
-     if (req.input === null || req.input === undefined) {
-         throw new HttpError("Input is required for embeddings.", 400);
-     }
-    req.input = [ String(req.input) ]; // Ensure array of strings
+  let model;
+  if (req.model.startsWith("models/")) {
+    model = req.model;
   } else {
-     req.input = req.input.map(item => String(item)); // Ensure all items are strings
-      if (req.input.length === 0) {
-           throw new HttpError("Input array is empty for embeddings.", 400);
-      }
+    if (!req.model.startsWith("gemini-")) {
+      req.model = DEFAULT_EMBEDDINGS_MODEL;
+    }
+    model = "models/" + req.model;
   }
-
-
-  // API endpoint is batchEmbedContents for multiple inputs
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/${modelEndpoint}:batchEmbedContents`, {
+  if (!Array.isArray(req.input)) {
+    req.input = [ req.input ];
+  }
+  const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
     body: JSON.stringify({
       "requests": req.input.map(text => ({
-        // model needs to be included in each request for batch endpoint
-        model: modelEndpoint,
-        content: { parts: [{ text }] }, // Input is text parts
-        outputDimensionality: req.dimensions, // Optional: specify dimension
+        model,
+        content: { parts: { text } },
+        outputDimensionality: req.dimensions,
       }))
     })
   });
-
-  let body;
-  const responseClone = response.clone();
-  let responseBodyText;
-    try {
-      responseBodyText = await responseClone.text();
-    } catch (e) {
-       console.error("Error reading response text:", e);
-        throw new HttpError("Failed to read response body from Google API: " + e.message, 500);
-    }
-
-
+  let { body } = response;
   if (response.ok) {
-    try {
-      const data = JSON.parse(responseBodyText);
-       if (!data.embeddings || !Array.isArray(data.embeddings)) {
-            if (data.error) {
-                console.error("Google API error in Embeddings JSON body:", data.error);
-                 throw new HttpError(data.error.message || "Google API error during embeddings.", data.error.code || 500, responseBodyText, response.status);
-            }
-           throw new Error("Unexpected response format: 'embeddings' array not found or invalid.");
-       }
-
-      body = JSON.stringify({
-        object: "list",
-        data: data.embeddings.map(({ values }, index) => ({
-          object: "embedding",
-          index, // Original index from the input request order
-          embedding: values,
-        })),
-        model: modelName, // Report the requested model name (without 'models/' prefix)
-        // Add usage if available from the API response
-         usage: data.usageMetadata ? transformUsage(data.usageMetadata) : undefined,
-      }, null, "  "); // Pretty print for debugging
-    } catch (err) {
-        console.error("Error processing embeddings response:", err);
-        if (err instanceof HttpError) throw err;
-        throw new HttpError("Error processing embeddings response from Google API: " + err.message, 500, responseBodyText, response.status);
-    }
-  } else {
-     console.error("Google API returned error status for embeddings:", response.status, response.statusText, responseBodyText);
-     let errorMessage = response.statusText;
-     try {
-         const errorData = JSON.parse(responseBodyText);
-         if (errorData.error?.message) {
-             errorMessage = errorData.error.message;
-         } else if (errorData.message) {
-             errorMessage = errorData.message;
-         }
-     } catch (parseErr) {
-         console.error("Failed to parse Google API error body for embeddings:", parseErr);
-     }
-      throw new HttpError(errorMessage, response.status, responseBodyText, response.status);
+    const { embeddings } = JSON.parse(await response.text());
+    body = JSON.stringify({
+      object: "list",
+      data: embeddings.map(({ values }, index) => ({
+        object: "embedding",
+        index,
+        embedding: values,
+      })),
+      model: req.model,
+    }, null, "  ");
   }
   return new Response(body, fixCors(response));
 }
 
-
-const DEFAULT_MODEL = "gemini-2.0-flash"; // Default chat model
+const DEFAULT_MODEL = "gemini-2.0-flash";
 async function handleCompletions (req, apiKey) {
-  let modelName = DEFAULT_MODEL;
-  // Determine the model name without the 'models/' prefix for the API call URL
-  // and for reporting in the response object.
-  if (typeof req.model === "string" && req.model) { // Check if model is a non-empty string
-      if (req.model.startsWith("models/")) {
-          modelName = req.model.substring(7); // Remove 'models/' prefix
-      } else {
-          modelName = req.model;
-      }
+  let model = DEFAULT_MODEL;
+  switch (true) {
+    case typeof req.model !== "string":
+      break;
+    case req.model.startsWith("models/"):
+      model = req.model.substring(7);
+      break;
+    case req.model.startsWith("gemini-"):
+    case req.model.startsWith("gemma-"):
+    case req.model.startsWith("learnlm-"):
+      model = req.model;
   }
-
-  let body = await transformRequest(req); // Transforms OpenAI -> Gemini request body
-
-  // Handle specific model suffix requests like "-search-preview" or ":search"
-  const originalModelReq = req.model?.toLowerCase() || "";
-  const isSearchModel = originalModelReq.endsWith(":search") || originalModelReq.endsWith("-search-preview");
-
-  if (isSearchModel) {
-      // Ensure the modelName used for the API call does *not* include the search suffix
-      if (modelName.endsWith(":search")) {
-          modelName = modelName.substring(0, modelName.length - 7);
-      } else if (modelName.endsWith("-search-preview")) {
-          modelName = modelName.substring(0, modelName.length - 16);
-      }
-      // Add the Google Search tool to the request body
+  let body = await transformRequest(req);
+  switch (true) {
+    case model.endsWith(":search"):
+      model = model.substring(0, model.length - 7);
+      // eslint-disable-next-line no-fallthrough
+    case req.model.endsWith("-search-preview"):
       body.tools = body.tools || [];
-      if (!body.tools.some(tool => tool.googleSearch)) {
-         body.tools.push({googleSearch: {}});
-      }
+      body.tools.push({googleSearch: {}});
   }
-
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
-  let url = `${BASE_URL}/${API_VERSION}/models/${modelName}:${TASK}`;
-  if (req.stream) {
-      url += "?alt=sse"; // Append alt=sse for Server-Sent Events streaming format
-  }
-
+  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
+  if (req.stream) { url += "?alt=sse"; }
   const response = await fetch(url, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
     body: JSON.stringify(body),
   });
 
-  let responseBody; // This will hold the final body for the Response object
-
+  body = response.body;
   if (response.ok) {
-    let id = "chatcmpl-" + generateId(); // Generate an OpenAI-like completion ID
-    const shared = {}; // Shared state for streaming transforms
-
+    let id = "chatcmpl-" + generateId(); //"chatcmpl-8pMMaqXMK68B3nyDBrapTDrhkHBQK";
+    const shared = {};
     if (req.stream) {
-      // Streaming response requires piping through transformations
-      responseBody = response.body
-        .pipeThrough(new TextDecoderStream()) // Decode bytes to text
-        .pipeThrough(new TransformStream({ // Parse SSE "data: " lines
+      body = response.body
+        .pipeThrough(new TextDecoderStream())
+        .pipeThrough(new TransformStream({
           transform: parseStream,
           flush: parseStreamFlush,
-          buffer: "", // Buffer for incomplete lines
-          shared, // Pass shared state
+          buffer: "",
+          shared,
         }))
-        .pipeThrough(new TransformStream({ // Transform Google format chunks to OpenAI stream format
+        .pipeThrough(new TransformStream({
           transform: toOpenAiStream,
           flush: toOpenAiStreamFlush,
-          streamIncludeUsage: req.stream_options?.include_usage, // Option to include usage in stream
-          model: req.model, // Pass original model name from request (can include 'models/')
-          id, // Pass the generated ID
-          last: [], // State for accumulating/tracking last chunk info per candidate
-          shared, // Pass shared state
+          streamIncludeUsage: req.stream_options?.include_usage,
+          model, id, last: [],
+          shared,
         }))
-        .pipeThrough(new TextEncoderStream()); // Encode text back to bytes for response body
+        .pipeThrough(new TextEncoderStream());
     } else {
-      // Non-streaming response
-      let responseBodyText;
+      body = await response.text();
       try {
-         const responseClone = response.clone();
-         responseBodyText = await responseClone.text();
-      } catch (e) {
-         console.error("Error reading non-streaming response text:", e);
-         throw new HttpError("Failed to read response body from Google API: " + e.message, 500);
-      }
-
-
-      try {
-        const data = JSON.parse(responseBodyText);
-        // Check for expected structure or API errors embedded in JSON
-        if (data.error) {
-           console.error("Google API error in Chat Completions JSON body:", data.error);
-           throw new HttpError(data.error.message || "Google API error during chat completion.", data.error.code || 500, responseBodyText, response.status);
-
-        } else if (!data.candidates && !data.promptFeedback) {
-          throw new Error("Invalid completion object: missing 'candidates' or 'promptFeedback'.");
-        } else {
-           responseBody = processCompletionsResponse(data, req.model, id);
+        body = JSON.parse(body);
+        if (!body.candidates) {
+          throw new Error("Invalid completion object");
         }
       } catch (err) {
-        console.error("Error parsing or processing non-streaming response:", err);
-        if (err instanceof HttpError) throw err;
-        throw new HttpError("Error processing chat completions response from Google API: " + err.message, 500, responseBodyText, response.status);
+        console.error("Error parsing response:", err);
+        return new Response(body, fixCors(response)); // output as is
       }
+      body = processCompletionsResponse(body, model, id);
     }
-  } else {
-     console.error("Google API returned error status for chat completions:", response.status, response.statusText, responseBodyText);
-     let errorMessage = response.statusText;
-     try {
-         const errorData = JSON.parse(responseBodyText);
-         if (errorData.error?.message) {
-             errorMessage = errorData.error.message;
-         } else if (errorData.message) {
-             errorMessage = errorData.message;
-         }
-     } catch (parseErr) {
-         console.error("Failed to parse Google API error body for chat completions:", parseErr);
-     }
-      throw new HttpError(errorMessage, response.status, responseBodyText, response.status);
   }
-
-  return new Response(responseBody, fixCors(response));
+  return new Response(body, fixCors(response));
 }
 
-
-// --- NEW FUNCTION FOR IMAGE GENERATION ---
-
-async function handleImageGenerations(req, apiKey) {
-    // This function handles requests to the /images/generations endpoint
-    // It expects an OpenAI-like request body for image generation:
-    // { prompt: string, n?: number, size?: string, response_format?: { type: "url" | "b64_json" } }
-    // It will call the Gemini generateContent API with an image generation model.
-
-    const prompt = req.prompt;
-    if (typeof prompt !== 'string' || !prompt || prompt.trim().length === 0) {
-        throw new HttpError("The 'prompt' field is required and must be a non-empty string.", 400);
-    }
-
-    // Gemini image generation uses a specific model via the generateContent endpoint
-    const geminiImageModel = "gemini-2.0-flash-exp-image-generation"; // Use the known image model name
-
-    // Construct the Gemini generateContent request body
-    const geminiRequestBody = {
-        contents: [{
-            role: "user",
-            parts: [{ text: prompt }] // Send the prompt as text content
-        }],
-        safetySettings: safetySettings, // Apply default safety settings
-        generationConfig: {
-           // OpenAI n -> Gemini candidateCount. Limit to 4 as Gemini typically supports up to 4 candidates.
-           candidateCount: req.n !== undefined && typeof req.n === 'number' && req.n >= 1 ? Math.min(Math.floor(req.n), 4) : 1, // Limit n to 1-4, default 1
-           // Gemini generateContent for image models doesn't have a 'size' parameter. Ignore req.size.
-        }
-        // Tools/tool_config are not applicable for simple image generation via this model
-    };
-
-     console.log("Calling Gemini Image Model:", geminiImageModel, "with prompt:", prompt);
-
-    // Call the Gemini generateContent API
-    const url = `${BASE_URL}/${API_VERSION}/models/${geminiImageModel}:generateContent`;
-    const response = await fetch(url, {
-        method: "POST",
-        headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-        body: JSON.stringify(geminiRequestBody),
-    });
-
-    let responseBody;
-    const responseClone = response.clone();
-    let responseBodyText;
-    try {
-       responseBodyText = await responseClone.text();
-    } catch (e) {
-        console.error("Error reading image generation response text:", e);
-        throw new HttpError("Failed to read response body from Google API: " + e.message, 500);
-    }
-
-
-    if (response.ok) {
-        try {
-            const data = JSON.parse(responseBodyText);
-
-            // Check for Google API errors embedded in JSON
-            if (data.error) {
-               console.error("Google API error in Image Generations JSON body:", data.error);
-               throw new HttpError(data.error.message || "Google API error during image generation.", data.error.code || 500, responseBodyText, response.status);
-            }
-
-             // Handle prompt blocking first
-            const choices = [];
-            if (checkPromptBlock(choices, data.promptFeedback, "message")) {
-                 // If prompt was blocked, checkPromptBlock added a choice with finish_reason: "content_filter"
-                 // For image generation, translate this to an OpenAI-style error response structure.
-                 let errorMessage = data.promptFeedback.blockReason ? `Prompt blocked: ${data.promptFeedback.blockReason}` : "Prompt blocked.";
-                 if (data.promptFeedback.safetyRatings) {
-                     errorMessage += " Details: " + data.promptFeedback.safetyRatings
-                         .filter(r => r.blocked)
-                         .map(r => `${r.category} (${r.probability})`)
-                         .join(", ");
-                 }
-                 // Throw HttpError which errHandler will format
-                 throw new HttpError(errorMessage, 400, responseBodyText, response.status);
-
-            }
-
-            // If not blocked, process candidates (should contain inlineData parts for images)
-            const imageUrls = []; // Array to hold the image objects ({ url: "..." } or { b64_json: "..." })
-            if (data.candidates && Array.isArray(data.candidates)) {
-                for (const candidate of data.candidates) {
-                    if (candidate.content?.parts && Array.isArray(candidate.content.parts)) {
-                        for (const part of candidate.content.parts) {
-                            if (part.inlineData && part.inlineData.mimeType && part.inlineData.data) {
-                                // Found an inline image part
-                                const mimeType = part.inlineData.mimeType;
-                                const base64Data = part.inlineData.data;
-
-                                const item = {};
-                                // Respect the requested response_format if specified
-                                const responseFormatType = req.response_format?.type || 'url'; // Default to 'url'
-
-                                if (responseFormatType === 'b64_json') {
-                                    item.b64_json = base64Data;
-                                } else { // Default or 'url'
-                                    // Create a data URL
-                                    item.url = `data:${mimeType};base64,${base64Data}`;
-                                }
-                                // Add revised_prompt? Gemini doesn't typically provide one for image gen
-                                // item.revised_prompt = ...;
-                                imageUrls.push(item);
-                            }
-                             // Ignore non-image parts (like text or function calls) in image generation response
-                        }
-                    }
-                }
-            }
-
-            if (imageUrls.length === 0 && (!data.candidates || data.candidates.length === 0)) {
-                 // If API returned OK but no candidates with images were found, and it wasn't blocked
-                 console.warn("Google API returned OK for image generation but found no candidates with image parts.");
-                 // Return an empty data array as success, similar to OpenAI behavior for no results.
-            }
-
-
-            // Construct OpenAI-style image generation response
-            const openaiResponse = {
-                created: Math.floor(Date.now() / 1000), // Unix timestamp
-                data: imageUrls, // Array of { url: "..." } or { b64_json: "..." }
-                // Add usage info if available (Gemini generateContent might provide usageMetadata)
-                usage: data.usageMetadata ? transformUsage(data.usageMetadata) : undefined,
-            };
-
-             responseBody = JSON.stringify(openaiResponse); // Compact JSON output
-
-        } catch (err) {
-            console.error("Error parsing or processing image generation response:", err);
-            if (err instanceof HttpError) throw err;
-            throw new HttpError("Error processing image generation response from Google API: " + err.message, 500, responseBodyText, response.status);
-        }
-    } else {
-       console.error("Google API returned error status for image generation:", response.status, response.statusText, responseBodyText);
-        let errorMessage = response.statusText;
-        try {
-            const errorData = JSON.parse(responseBodyText);
-            if (errorData.error?.message) {
-                errorMessage = errorData.error.message;
-            } else if (errorData.message) {
-                errorMessage = errorData.message;
-            }
-        } catch (parseErr) {
-            console.error("Failed to parse Google API error body for image generation:", parseErr);
-        }
-       throw new HttpError(errorMessage, response.status, responseBodyText, response.status);
-    }
-
-    // Return the final Response object with appropriate headers
-    return new Response(responseBody, fixCors(response));
-}
-
-
-// Helper to adjust schema properties for compatibility (e.g., remove additionalProperties: false)
 const adjustProps = (schemaPart) => {
   if (typeof schemaPart !== "object" || schemaPart === null) {
     return;
@@ -592,15 +222,10 @@ const adjustProps = (schemaPart) => {
     Object.values(schemaPart).forEach(adjustProps);
   }
 };
-const adjustSchema = (tool) => {
-  if (!tool || tool.type !== "function" || !tool.function || !tool.function.parameters) {
-      return;
-  }
-  const parameters = tool.function.parameters;
-  if (parameters.type === "object" && parameters.strict !== undefined) {
-     delete parameters.strict;
-  }
-  adjustProps(parameters);
+const adjustSchema = (schema) => {
+  const obj = schema[schema.type];
+  delete obj.strict;
+  return adjustProps(schema);
 };
 
 const harmCategory = [
@@ -614,45 +239,32 @@ const safetySettings = harmCategory.map(category => ({
   category,
   threshold: "BLOCK_NONE",
 }));
-
 const fieldsMap = {
   frequency_penalty: "frequencyPenalty",
+  max_completion_tokens: "maxOutputTokens",
   max_tokens: "maxOutputTokens",
+  n: "candidateCount", // not for streaming
   presence_penalty: "presencePenalty",
   seed: "seed",
-  top_k: "topK",
+  stop: "stopSequences",
+  temperature: "temperature",
+  top_k: "topK", // non-standard
   top_p: "topP",
 };
-
 const transformConfig = (req) => {
   let cfg = {};
-  for (const openAiKey in fieldsMap) {
-    const geminiKey = fieldsMap[openAiKey];
-    if (req[openAiKey] !== undefined) {
-      cfg[geminiKey] = req[openAiKey];
+  //if (typeof req.stop === "string") { req.stop = [req.stop]; } // no need
+  for (let key in req) {
+    const matchedKey = fieldsMap[key];
+    if (matchedKey) {
+      cfg[matchedKey] = req[key];
     }
   }
-
-  if (req.stop !== undefined) {
-      cfg.stopSequences = Array.isArray(req.stop) ? req.stop : [req.stop];
-  }
-  if (req.n !== undefined && !req.stream) {
-      if (typeof req.n === 'number' && req.n >= 1) {
-          cfg.candidateCount = req.n;
-      } else {
-          console.warn(`Invalid value for 'n' in request: ${req.n}. Ignoring.`);
-      }
-  }
-
-
   if (req.response_format) {
     switch (req.response_format.type) {
       case "json_schema":
-        if (!req.response_format.json_schema?.schema) {
-             throw new HttpError("json_schema response_format requires a 'schema' object.", 400);
-        }
-        adjustProps(req.response_format.json_schema.schema);
-        cfg.responseSchema = req.response_format.json_schema.schema;
+        adjustSchema(req.response_format);
+        cfg.responseSchema = req.response_format.json_schema?.schema;
         if (cfg.responseSchema && "enum" in cfg.responseSchema) {
           cfg.responseMimeType = "text/x.enum";
           break;
@@ -665,7 +277,7 @@ const transformConfig = (req) => {
         cfg.responseMimeType = "text/plain";
         break;
       default:
-        throw new HttpError(`Unsupported response_format.type: "${req.response_format.type}"`, 400);
+        throw new HttpError("Unsupported response_format.type", 400);
     }
   }
   return cfg;
@@ -677,28 +289,19 @@ const parseImg = async (url) => {
     try {
       const response = await fetch(url);
       if (!response.ok) {
-        throw new Error(`Failed to fetch image from URL: ${response.status} ${response.statusText} (${url})`);
+        throw new Error(`${response.status} ${response.statusText} (${url})`);
       }
       mimeType = response.headers.get("content-type");
-      if (!mimeType || !mimeType.startsWith('image/')) {
-           console.warn(`Warning: Fetched URL (${url}) did not return an image Content-Type (${mimeType || 'none'}). Attempting to process.`);
-           if (!mimeType) mimeType = 'application/octet-stream';
-      }
       data = Buffer.from(await response.arrayBuffer()).toString("base64");
     } catch (err) {
-      throw new HttpError("Error fetching image from URL: " + err.message, 400);
+      throw new Error("Error fetching image: " + err.toString());
     }
-  } else if (url.startsWith("data:")) {
+  } else {
     const match = url.match(/^data:(?<mimeType>.*?)(;base64)?,(?<data>.*)$/);
-    if (!match || !match.groups?.mimeType || !match.groups?.data) {
-      throw new HttpError("Invalid image data URL format.", 400);
+    if (!match) {
+      throw new HttpError("Invalid image data: " + url, 400);
     }
     ({ mimeType, data } = match.groups);
-     if (!mimeType.startsWith('image/')) {
-         console.warn(`Warning: Data URL does not specify an image MIME type (${mimeType}). Attempting to process.`);
-     }
-  } else {
-    throw new HttpError("Unsupported image URL format. Must be http, https, or data URL.", 400);
   }
   return {
     inlineData: {
@@ -708,283 +311,174 @@ const parseImg = async (url) => {
   };
 };
 
+const transformFnResponse = ({ content, tool_call_id }, parts) => {
+  if (!parts.calls) {
+    throw new HttpError("No function calls found in the previous message", 400);
+  }
+  let response;
+  try {
+    response = JSON.parse(content);
+  } catch (err) {
+    console.error("Error parsing function response content:", err);
+    throw new HttpError("Invalid function response: " + content, 400);
+  }
+  if (typeof response !== "object" || response === null || Array.isArray(response)) {
+    response = { result: response };
+  }
+  if (!tool_call_id) {
+    throw new HttpError("tool_call_id not specified", 400);
+  }
+  const { i, name } = parts.calls[tool_call_id] ?? {};
+  if (!name) {
+    throw new HttpError("Unknown tool_call_id: " + tool_call_id, 400);
+  }
+  if (parts[i]) {
+    throw new HttpError("Duplicated tool_call_id: " + tool_call_id, 400);
+  }
+  parts[i] = {
+    functionResponse: {
+      id: tool_call_id.startsWith("call_") ? null : tool_call_id,
+      name,
+      response,
+    }
+  };
+};
 
 const transformFnCalls = ({ tool_calls }) => {
-  const callsMapping = {}; // Map tool_call_id -> function.name
+  const calls = {};
   const parts = tool_calls.map(({ function: { arguments: argstr, name }, id, type }, i) => {
     if (type !== "function") {
-      throw new HttpError(`Unsupported tool_call type in assistant message history: "${type}". Only "function" is supported.`, 400);
+      throw new HttpError(`Unsupported tool_call type: "${type}"`, 400);
     }
     let args;
     try {
       args = JSON.parse(argstr);
     } catch (err) {
-      console.error("Error parsing function arguments in assistant message:", err);
-      throw new HttpError("Invalid function arguments in assistant message history: " + argstr, 400);
+      console.error("Error parsing function arguments:", err);
+      throw new HttpError("Invalid function arguments: " + argstr, 400);
     }
-    callsMapping[id] = name; // Store the mapping for potential subsequent 'tool' messages
+    calls[id] = {i, name};
     return {
       functionCall: {
+        id: id.startsWith("call_") ? null : id,
         name,
         args,
       }
     };
   });
-  parts.callsMapping = callsMapping;
+  parts.calls = calls;
+  return parts;
+};
+
+const transformMsg = async ({ content }) => {
+  const parts = [];
+  if (!Array.isArray(content)) {
+    // system, user: string
+    // assistant: string or null (Required unless tool_calls is specified.)
+    parts.push({ text: content });
+    return parts;
+  }
+  // user:
+  // An array of content parts with a defined type.
+  // Supported options differ based on the model being used to generate the response.
+  // Can contain text, image, or audio inputs.
+  for (const item of content) {
+    switch (item.type) {
+      case "text":
+        parts.push({ text: item.text });
+        break;
+      case "image_url":
+        parts.push(await parseImg(item.image_url.url));
+        break;
+      case "input_audio":
+        parts.push({
+          inlineData: {
+            mimeType: "audio/" + item.input_audio.format,
+            data: item.input_audio.data,
+          }
+        });
+        break;
+      default:
+        throw new HttpError(`Unknown "content" item type: "${item.type}"`, 400);
+    }
+  }
+  if (content.every(item => item.type === "image_url")) {
+    parts.push({ text: "" }); // to avoid "Unable to submit request because it must have a text parameter"
+  }
   return parts;
 };
 
 const transformMessages = async (messages) => {
-  if (!messages || !Array.isArray(messages)) {
-      if (messages === undefined) return { contents: [] };
-      throw new HttpError("messages must be an array.", 400);
-  }
-
+  if (!messages) { return; }
   const contents = [];
-  let system_instruction_parts = []; // Accumulate system parts
-  let lastAssistantToolCallsMapping = {}; // Store mapping from the previous assistant message tool_calls
-
+  let system_instruction;
   for (const item of messages) {
-    const message = JSON.parse(JSON.stringify(item)); // Deep clone message
-
-    switch (message.role) {
+    switch (item.role) {
       case "system":
-         if (typeof message.content === 'string' && message.content.trim().length > 0) {
-             system_instruction_parts.push({ text: message.content });
-         } else {
-             console.warn("Skipping empty or invalid system message content.");
-         }
+        system_instruction = { parts: await transformMsg(item) };
         continue;
-
-      case "tool": {
-        if (!message.tool_call_id) {
-             throw new HttpError("tool_call_id is required for messages with role 'tool'.", 400);
+      case "tool":
+        // eslint-disable-next-line no-case-declarations
+        let { role, parts } = contents[contents.length - 1] ?? {};
+        if (role !== "function") {
+          const calls = parts?.calls;
+          parts = []; parts.calls = calls;
+          contents.push({
+            role: "function", // ignored
+            parts
+          });
         }
-        const functionName = lastAssistantToolCallsMapping[message.tool_call_id];
-        if (!functionName) {
-             throw new HttpError(`Function name not found for tool_call_id "${message.tool_call_id}". Ensure the immediately preceding assistant message contained this tool_call_id.`, 400);
-        }
-
-        let responseData;
-        try {
-            responseData = JSON.parse(message.content);
-        } catch (err) {
-             console.error("Error parsing tool message content:", err);
-             throw new HttpError("Invalid content in tool message (not valid JSON).", 400);
-        }
-
-        contents.push({
-            role: "user", // Tool response is part of the user's turn
-            parts: [{
-                 functionResponse: {
-                    name: functionName,
-                    response: responseData,
-                 }
-            }]
-        });
-
-        lastAssistantToolCallsMapping = {}; // Reset mapping after a user turn (or tool turn responding for user)
-        break;
-
-      }
-
+        transformFnResponse(item, parts);
+        continue;
       case "assistant":
-        message.role = "model";
-
-        if (message.tool_calls && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-             const toolCallParts = transformFnCalls(message);
-             message.parts = toolCallParts;
-             lastAssistantToolCallsMapping = toolCallParts.callsMapping || {};
-
-             if (message.content !== undefined && message.content !== null && message.content !== "") {
-                 console.warn("Assistant message has both tool_calls and non-empty content. Prioritizing tool_calls and ignoring content.");
-             }
-             delete message.content;
-
-        } else {
-             message.parts = await transformMsgContent(message);
-             lastAssistantToolCallsMapping = {};
-             delete message.content;
-        }
-        contents.push({
-            role: message.role,
-            parts: message.parts
-        });
+        item.role = "model";
         break;
-
       case "user":
-        message.role = "user";
-
-        message.parts = await transformMsgContent(message);
-
-         if (!message.parts || message.parts.length === 0) {
-             message.parts = [{ text: "" }];
-             console.warn("Empty user message content received, adding empty text part.");
-         }
-
-         delete message.content;
-        lastAssistantToolCallsMapping = {};
-
-        contents.push({
-            role: message.role,
-            parts: message.parts
-        });
         break;
-
-
       default:
         throw new HttpError(`Unknown message role: "${item.role}"`, 400);
     }
+    contents.push({
+      role: item.role,
+      parts: item.tool_calls ? transformFnCalls(item) : await transformMsg(item)
+    });
   }
-
-  let system_instruction = system_instruction_parts.length > 0 ? { parts: system_instruction_parts } : undefined;
-
-
-  if (contents.length > 0 && contents[0].role !== "user") {
-      contents.unshift({ role: "user", parts: [{ text: "" }] });
+  if (system_instruction) {
+    if (!contents[0]?.parts.some(part => part.text)) {
+      contents.unshift({ role: "user", parts: { text: " " } });
+    }
   }
-
-  contents.forEach(content => {
-      if (content.parts && Array.isArray(content.parts)) {
-           delete content.parts.callsMapping;
-      }
-  });
-
-  // console.info("Transformed Gemini Request Contents:", JSON.stringify(contents, null, 2));
-  // console.info("Transformed Gemini Request System Instruction:", JSON.stringify(system_instruction, null, 2));
-
+  //console.info(JSON.stringify(contents, 2));
   return { system_instruction, contents };
 };
 
-const transformMsgContent = async (message) => {
-  const parts = [];
-  const content = message.content;
-
-  if (content === null || content === undefined || (Array.isArray(content) && content.length === 0)) {
-      return parts;
-  }
-
-  if (!Array.isArray(content)) {
-    parts.push({ text: String(content) });
-    return parts;
-  }
-
-  let hasText = false;
-  for (const item of content) {
-    if (typeof item !== 'object' || item === null) {
-        console.warn("Unexpected item type in message content array:", item);
-        continue;
-    }
-    switch (item.type) {
-      case "text":
-        if (typeof item.text === 'string') {
-            parts.push({ text: item.text });
-            hasText = true;
-        } else {
-            console.warn("Invalid text part: text field is not a string.", item);
-        }
-        break;
-      case "image_url":
-        if (typeof item.image_url?.url === 'string') {
-             try {
-               const imgPart = await parseImg(item.image_url.url);
-               parts.push(imgPart);
-             } catch (err) {
-                console.error("Failed to process image_url:", err);
-                throw new HttpError("Failed to process image_url: " + err.message, 400);
-             }
-        } else {
-             throw new HttpError("Invalid image_url part: missing 'url' string.", 400);
-        }
-        break;
-      case "input_audio":
-        if (typeof item.input_audio?.format === 'string' && typeof item.input_audio?.data === 'string') {
-             parts.push({
-                inlineData: {
-                    mimeType: item.input_audio.format.startsWith("audio/") ? item.input_audio.format : `audio/${item.input_audio.format}`,
-                    data: item.input_audio.data,
-                }
-             });
-        } else {
-             throw new HttpError("Invalid input_audio part: missing 'format' or 'data'.", 400);
-        }
-        break;
-      default:
-        console.warn(`Unknown or unsupported "content" item type (skipping): "${item.type}"`);
-    }
-  }
-
-  if (parts.length > 0 && !hasText) {
-       const hasExistingTextPart = parts.some(p => p.text !== undefined);
-       if (!hasExistingTextPart) {
-           parts.push({ text: "" });
-       }
-  }
-
-  return parts;
-};
-
-
 const transformTools = (req) => {
   let tools, tool_config;
-  if (req.tools && Array.isArray(req.tools)) {
+  if (req.tools) {
     const funcs = req.tools.filter(tool => tool.type === "function");
-    if (funcs.length > 0) {
-         funcs.forEach(adjustSchema);
-         tools = [{ function_declarations: funcs.map(tool => tool.function) }];
-    } else {
-         tools = [];
-    }
-  } else if (req.tools !== undefined && req.tools !== null) {
-       console.warn("Request 'tools' field is not an array. Ignoring.");
+    funcs.forEach(adjustSchema);
+    tools = [{ function_declarations: funcs.map(schema => schema.function) }];
   }
-
-
-  if (req.tool_choice !== undefined) {
-    if (typeof req.tool_choice === "string") {
-      const mode = req.tool_choice.toUpperCase();
-      if (['NONE', 'AUTO', 'REQUIRED'].includes(mode)) {
-         tool_config = { function_calling_config: { mode: mode } };
-      } else {
-         throw new HttpError(`Unsupported tool_choice string value: "${req.tool_choice}". Must be "none", "auto", or "required".`, 400);
-      }
-    } else if (typeof req.tool_choice === "object" && req.tool_choice !== null && req.tool_choice.type === "function") {
-        const functionName = req.tool_choice.function?.name;
-        if (typeof functionName === "string" && functionName) {
-            tool_config = { function_calling_config: { mode: "ANY", allowed_function_names: [functionName] } };
-        } else {
-             throw new HttpError("Invalid tool_choice object: 'function.name' string is required for type 'function'.", 400);
+  if (req.tool_choice) {
+    const allowed_function_names = req.tool_choice?.type === "function" ? [ req.tool_choice?.function?.name ] : undefined;
+    if (allowed_function_names || typeof req.tool_choice === "string") {
+      tool_config = {
+        function_calling_config: {
+          mode: allowed_function_names ? "ANY" : req.tool_choice.toUpperCase(),
+          allowed_function_names
         }
-    } else {
-       throw new HttpError("Invalid tool_choice format.", 400);
+      };
     }
   }
-
   return { tools, tool_config };
 };
 
-
-const transformRequest = async (req) => {
-    const { system_instruction, contents } = await transformMessages(req.messages);
-    const generationConfig = transformConfig(req);
-    const { tools, tool_config } = transformTools(req);
-
-    const geminiRequestBody = {
-        contents,
-        ...(system_instruction && { system_instruction }),
-        generationConfig,
-        safetySettings,
-        ...(tools && tools.length > 0 && { tools }),
-        ...(tool_config && { tool_config }),
-    };
-
-    // console.info("Final Gemini Chat Request Body:", JSON.stringify(geminiRequestBody, null, 2));
-
-    return geminiRequestBody;
-};
-
-
-// --- Response Processing and Streaming ---
+const transformRequest = async (req) => ({
+  ...await transformMessages(req.messages),
+  safetySettings,
+  generationConfig: transformConfig(req),
+  ...transformTools(req),
+});
 
 const generateId = () => {
   const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -992,333 +486,162 @@ const generateId = () => {
   return Array.from({ length: 29 }, randomChar).join("");
 };
 
-const reasonsMap = {
+const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse#finishreason
+  //"FINISH_REASON_UNSPECIFIED": // Default value. This value is unused.
   "STOP": "stop",
   "MAX_TOKENS": "length",
   "SAFETY": "content_filter",
   "RECITATION": "content_filter",
-  "OTHER": "other",
+  //"OTHER": "OTHER",
 };
-
-const transformMessageResponse = (cand) => {
-  const message = {
-      role: "assistant",
-      content: [],
-  };
-  let hasFunctionCall = false;
-
-  if (cand.content?.parts && Array.isArray(cand.content.parts)) {
-      const tool_calls = [];
-      const content_parts = [];
-
-      for (const part of cand.content.parts) {
-          if (part.text !== undefined) {
-              content_parts.push({ type: "text", text: part.text });
-          } else if (part.inlineData !== undefined) {
-               if (part.inlineData.mimeType && part.inlineData.data) {
-                    content_parts.push({
-                        type: "image_url",
-                        image_url: {
-                            url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
-                        }
-                    });
-               } else {
-                   console.warn("Skipping invalid inlineData part in candidate:", part.inlineData);
-               }
-          } else if (part.functionCall !== undefined) {
-              const fc = part.functionCall;
-              if (fc.name && fc.args !== undefined) {
-                   tool_calls.push({
-                       id: fc.id ?? "call_" + generateId(),
-                       type: "function",
-                       function: {
-                           name: fc.name,
-                           arguments: JSON.stringify(fc.args),
-                       }
-                   });
-                   hasFunctionCall = true;
-              } else {
-                   console.warn("Skipping invalid functionCall part in candidate:", part.functionCall);
-              }
-          }
-      }
-
-      message.content = content_parts.length > 0 ? content_parts : null;
-      if (tool_calls.length > 0) {
-          message.tool_calls = tool_calls;
-      }
-  } else {
-       message.content = null;
+const SEP = "\n\n|>";
+const transformCandidates = (key, cand) => {
+  const message = { role: "assistant", content: [] };
+  for (const part of cand.content?.parts ?? []) {
+    if (part.functionCall) {
+      const fc = part.functionCall;
+      message.tool_calls = message.tool_calls ?? [];
+      message.tool_calls.push({
+        id: fc.id ?? "call_" + generateId(),
+        type: "function",
+        function: {
+          name: fc.name,
+          arguments: JSON.stringify(fc.args),
+        }
+      });
+    } else {
+      message.content.push(part.text);
+    }
   }
-
-  let finish_reason = reasonsMap[cand.finishReason] || cand.finishReason || null;
-
-  if (hasFunctionCall) {
-      finish_reason = "tool_calls";
-  }
-
+  message.content = message.content.join(SEP) || null;
   return {
-    index: cand.index || 0,
-    message: message,
+    index: cand.index || 0, // 0-index is absent in new -002 models response
+    [key]: message,
     logprobs: null,
-    finish_reason: finish_reason,
+    finish_reason: message.tool_calls ? "tool_calls" : reasonsMap[cand.finishReason] || cand.finishReason,
+    //original_finish_reason: cand.finishReason,
   };
 };
+const transformCandidatesMessage = transformCandidates.bind(null, "message");
+const transformCandidatesDelta = transformCandidates.bind(null, "delta");
 
-const transformDeltaResponse = (cand) => {
-    const delta = {}; // Start with an empty delta
-
-     if (cand.content?.parts && Array.isArray(cand.content.parts)) {
-        const delta_tool_calls = [];
-        const delta_content_parts = [];
-
-        for (const part of cand.content.parts) {
-            if (part.text !== undefined) {
-                 delta_content_parts.push({ type: "text", text: part.text });
-            } else if (part.inlineData !== undefined) {
-                 if (part.inlineData.mimeType && part.inlineData.data) {
-                     delta_content_parts.push({
-                         type: "image_url",
-                         image_url: {
-                             url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`
-                         }
-                     });
-                 } else {
-                     console.warn("Skipping invalid inlineData part in stream chunk:", part.inlineData);
-                 }
-            } else if (part.functionCall !== undefined) {
-                 const fc = part.functionCall;
-                 if (fc.name && fc.args !== undefined) {
-                     delta_tool_calls.push({
-                          id: fc.id ?? "call_" + generateId(),
-                          type: "function",
-                          function: {
-                              name: fc.name,
-                              arguments: JSON.stringify(fc.args),
-                          }
-                     });
-                 } else {
-                      console.warn("Skipping invalid functionCall part in stream chunk:", part.functionCall);
-                 }
-            }
-        }
-
-        if (delta_content_parts.length > 0) {
-            delta.content = delta_content_parts;
-        }
-
-        if (delta_tool_calls.length > 0) {
-             delta.tool_calls = delta_tool_calls;
-        }
-     }
-
-    let finish_reason = reasonsMap[cand.finishReason] || cand.finishReason || null;
-
-    return {
-        index: cand.index || 0,
-        delta: delta,
-        finish_reason: finish_reason,
-    };
-};
-
+const transformUsage = (data) => ({
+  completion_tokens: data.candidatesTokenCount,
+  prompt_tokens: data.promptTokenCount,
+  total_tokens: data.totalTokenCount
+});
 
 const checkPromptBlock = (choices, promptFeedback, key) => {
-  if (choices.length > 0) {
-      return false;
-  }
-
+  if (choices.length) { return; }
   if (promptFeedback?.blockReason) {
-    console.log("Prompt was blocked by Google API. Reason:", promptFeedback.blockReason);
-    if (promptFeedback.blockReason === "SAFETY" && promptFeedback.safetyRatings) {
+    console.log("Prompt block reason:", promptFeedback.blockReason);
+    if (promptFeedback.blockReason === "SAFETY") {
       promptFeedback.safetyRatings
         .filter(r => r.blocked)
-        .forEach(r => console.log(`- Safety Category: ${r.category}, Probability: ${r.probability}, Blocked: ${r.blocked}`));
+        .forEach(r => console.log(r));
     }
-
     choices.push({
       index: 0,
-      [key]: (key === "message") ? null : {},
+      [key]: null,
       finish_reason: "content_filter",
+      //original_finish_reason: data.promptFeedback.blockReason,
     });
-    return true;
   }
-  return false;
+  return true;
 };
-
 
 const processCompletionsResponse = (data, model, id) => {
   const obj = {
     id,
-    choices: [],
+    choices: data.candidates.map(transformCandidatesMessage),
     created: Math.floor(Date.now()/1000),
-    model: model.startsWith("models/") ? model.substring(7) : model,
+    model: data.modelVersion ?? model,
+    //system_fingerprint: "fp_69829325d0",
     object: "chat.completion",
+    usage: data.usageMetadata && transformUsage(data.usageMetadata),
   };
-
-  if (data.candidates && Array.isArray(data.candidates)) {
-     obj.choices = data.candidates.map(transformMessageResponse);
-  } else {
-      console.warn("Google API response missing 'candidates' array for non-streaming chat completion.");
-      obj.choices = [];
+  if (obj.choices.length === 0 ) {
+    checkPromptBlock(obj.choices, data.promptFeedback, "message");
   }
-
-  checkPromptBlock(obj.choices, data.promptFeedback, "message");
-
-  if (data.usageMetadata) {
-    obj.usage = transformUsage(data.usageMetadata);
-  } else if (data.promptFeedback?.tokenCount) {
-       obj.usage = { prompt_tokens: data.promptFeedback.tokenCount, completion_tokens: 0, total_tokens: data.promptFeedback.tokenCount };
-  } else {
-      obj.usage = undefined;
-  }
-
   return JSON.stringify(obj);
 };
 
-const transformUsage = (data) => {
-  const usage = {
-    prompt_tokens: data.promptTokenCount ?? 0,
-    completion_tokens: data.candidatesTokenCount ?? 0,
-    total_tokens: data.totalTokenCount ?? 0,
-  };
-   Object.keys(usage).forEach(key => { usage[key] = Number(usage[key]) || 0; });
-   return usage;
-};
-
-
-const responseLineRE_single = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
-
+const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
 function parseStream (chunk, controller) {
   this.buffer += chunk;
-  let match;
-  while ((match = this.buffer.match(responseLineRE_single)) !== null) {
+  do {
+    const match = this.buffer.match(responseLineRE);
+    if (!match) { break; }
     controller.enqueue(match[1]);
-    this.buffer = this.buffer.buffer.slice(match[0].length).toString();
-  }
+    this.buffer = this.buffer.substring(match[0].length);
+  } while (true); // eslint-disable-line no-constant-condition
 }
-
 function parseStreamFlush (controller) {
-  if (this.buffer.length > 0) {
-    console.error("parseStream: Remaining data in buffer after flush:", this.buffer);
+  if (this.buffer) {
+    console.error("Invalid data:", this.buffer);
     controller.enqueue(this.buffer);
     this.shared.is_buffers_rest = true;
   }
-  this.buffer = "";
 }
 
 const delimiter = "\n\n";
-
 const sseline = (obj) => {
-  const dataString = JSON.stringify(obj);
-  return `data: ${dataString}${delimiter}`;
+  obj.created = Math.floor(Date.now()/1000);
+  return "data: " + JSON.stringify(obj) + delimiter;
 };
-
 function toOpenAiStream (line, controller) {
   let data;
   try {
     data = JSON.parse(line);
-    if (data.error) {
-        console.error("Google API stream error chunk:", data.error);
-        const errorChunk = {
-            id: this.id,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now()/1000),
-            model: this.model.startsWith("models/") ? this.model.substring(7) : this.model,
-            choices: [{
-                index: 0,
-                delta: { role: "assistant" },
-                finish_reason: "tool_error",
-            }],
-            error: {
-                message: data.error.message || "An error occurred during streaming.",
-                type: data.error.status || "api_error",
-                code: data.error.code,
-             },
-        };
-        controller.enqueue(sseline(errorChunk));
-        controller.enqueue("data: [DONE]" + delimiter);
-        return;
+    if (!data.candidates) {
+      throw new Error("Invalid completion chunk object");
     }
-    if (!data.candidates && !data.promptFeedback) {
-       if (this.shared.is_buffers_rest && line.trim().length > 0) {
-           console.warn("toOpenAiStream: Ignoring potentially incomplete or malformed chunk:", line);
-       } else {
-           console.warn("toOpenAiStream: Unexpected Google API stream chunk format:", data);
-       }
-       return;
-    }
-
   } catch (err) {
-    console.error("toOpenAiStream: Error parsing JSON line:", err, "Line:", line);
-    if (!this.shared.is_buffers_rest || line.trim().length > 0) {
-        controller.error(new Error("Failed to parse stream chunk JSON: " + err.message));
-    }
+    console.error("Error parsing response:", err);
+    if (!this.shared.is_buffers_rest) { line =+ delimiter; }
+    controller.enqueue(line); // output as is
     return;
   }
-
-  if (data.promptFeedback) {
-      const choices = [];
-      if (checkPromptBlock(choices, data.promptFeedback, "delta")) {
-          const blockChunk = {
-             id: this.id,
-             object: "chat.completion.chunk",
-             created: Math.floor(Date.now()/1000),
-             model: this.model.startsWith("models/") ? this.model.substring(7) : this.model,
-             choices: choices,
-             usage: data.promptFeedback.tokenCount ? { prompt_tokens: data.promptFeedback.tokenCount, completion_tokens: 0, total_tokens: data.promptFeedback.tokenCount } : undefined,
-          };
-           controller.enqueue(sseline(blockChunk));
-           controller.enqueue("data: [DONE]" + delimiter);
-           return;
-      }
-       if (!data.candidates) {
-           console.warn("toOpenAiStream: Chunk contains promptFeedback but no candidates and is not a block.", data);
-           return;
-       }
+  const obj = {
+    id: this.id,
+    choices: data.candidates.map(transformCandidatesDelta),
+    //created: Math.floor(Date.now()/1000),
+    model: data.modelVersion ?? this.model,
+    //system_fingerprint: "fp_69829325d0",
+    object: "chat.completion.chunk",
+    usage: data.usageMetadata && this.streamIncludeUsage ? null : undefined,
+  };
+  if (checkPromptBlock(obj.choices, data.promptFeedback, "delta")) {
+    controller.enqueue(sseline(obj));
+    return;
   }
-
-  if (data.candidates && Array.isArray(data.candidates)) {
-    const openaiChoices = data.candidates.map(transformDeltaResponse);
-
-    openaiChoices.forEach(choice => {
-        const index = choice.index || 0;
-        if (!this.last[index]) {
-            this.last[index] = { delta: {}, finish_reason: null };
-        }
-
-        if (index === 0 && Object.keys(this.last[index].delta).length === 0 && !choice.delta.role) {
-             choice.delta = choice.delta || {};
-             choice.delta.role = "assistant";
-        }
-
-        if (choice.finish_reason) {
-            this.last[index].finish_reason = choice.finish_reason;
-        }
-
-        const openaiChunk = {
-           id: this.id,
-           object: "chat.completion.chunk",
-           created: Math.floor(Date.now()/1000),
-           model: this.model.startsWith("models/") ? this.model.substring(7) : this.model,
-           choices: [choice],
-           usage: data.usageMetadata && this.streamIncludeUsage ? transformUsage(data.usageMetadata) : undefined,
-        };
-
-         const deltaHasMeaningfulContent = choice.delta && (Object.keys(choice.delta).length > 0 || choice.delta.role);
-         const chunkHasFinishReasonOrUsage = choice.finish_reason || openaiChunk.usage;
-
-         if (deltaHasMeaningfulContent || chunkHasFinishReasonOrUsage) {
-             controller.enqueue(sseline(openaiChunk));
-         }
-    });
-
-  } else {
-      console.warn("toOpenAiStream: Chunk missing 'candidates' array and not a prompt block:", data);
+  console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
+  const cand = obj.choices[0];
+  cand.index = cand.index || 0; // absent in new -002 models response
+  const finish_reason = cand.finish_reason;
+  cand.finish_reason = null;
+  if (!this.last[cand.index]) { // first
+    controller.enqueue(sseline({
+      ...obj,
+      choices: [{ ...cand, tool_calls: undefined, delta: { role: "assistant", content: "" } }],
+    }));
   }
+  delete cand.delta.role;
+  if ("content" in cand.delta) { // prevent empty data (e.g. when MAX_TOKENS)
+    controller.enqueue(sseline(obj));
+  }
+  cand.finish_reason = finish_reason;
+  if (data.usageMetadata && this.streamIncludeUsage) {
+    obj.usage = transformUsage(data.usageMetadata);
+  }
+  cand.delta = {};
+  this.last[cand.index] = obj;
 }
-
 function toOpenAiStreamFlush (controller) {
-  controller.enqueue("data: [DONE]" + delimiter);
-  this.last = [];
-  this.shared = {};
+  if (this.last.length > 0) {
+    for (const obj of this.last) {
+      controller.enqueue(sseline(obj));
+    }
+    controller.enqueue("data: [DONE]" + delimiter);
+  }
 }
